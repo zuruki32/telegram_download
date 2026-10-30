@@ -35,9 +35,29 @@ except ImportError:  # progress bars are optional
 # ---------------------------------------------------------------------------
 # Credentials
 # ---------------------------------------------------------------------------
-# Read from environment first, fall back to prompting. Get these from
+def load_env_file():
+    """Load KEY=VALUE pairs from a local .env file next to this script.
+
+    Keeps your api_id/api_hash out of the shell and out of git (.env is
+    gitignored). Existing environment variables win, so you can still
+    override with `export` if you want.
+    """
+    env_path = Path(__file__).resolve().parent / ".env"
+    if not env_path.exists():
+        return
+    for line in env_path.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key, value = key.strip(), value.strip().strip('"').strip("'")
+        os.environ.setdefault(key, value)
+
+
+# Read from .env / environment first, fall back to prompting. Get these from
 # https://my.telegram.org -> "API development tools".
 def get_credentials():
+    load_env_file()
     api_id = os.environ.get("TG_API_ID")
     api_hash = os.environ.get("TG_API_HASH")
     if not api_id:
