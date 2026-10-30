@@ -27,12 +27,16 @@ pip install -r requirements.txt
 
 ## 3. Run
 
-Put your key in the environment so you aren't asked each time:
+Put your key in a `.env` file next to `download.py` (copy `.env.example`):
 
-```bash
-export TG_API_ID=1234567
-export TG_API_HASH=your_api_hash_here
 ```
+TG_API_ID=1234567
+TG_API_HASH=your_api_hash_here
+```
+
+The app loads it automatically. `.env` is gitignored, so your key is never
+committed. (You can also `export TG_API_ID` / `TG_API_HASH` instead; those
+override the file.)
 
 Then:
 
