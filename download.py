@@ -22,7 +22,7 @@ import os
 import sys
 from pathlib import Path
 
-from telethon import TelegramClient
+from telethon import TelegramClient, events
 from telethon.errors import FloodWaitError
 from telethon.tl.types import Channel, Chat, User
 
@@ -150,68 +150,104 @@ def target_filename(message, folder):
     return folder / f"{message.id:>09}_{base}{suffix}"
 
 
-async def download_channel(client, entity, out_root, limit):
+def channel_folder(entity, out_root):
+    """Per-channel output folder (created if missing)."""
     folder = out_root / safe_name(getattr(entity, "title", None), str(entity.id))
     folder.mkdir(parents=True, exist_ok=True)
+    return folder
 
+
+async def download_one(client, message, folder):
+    """Download a single message's media into folder.
+
+    Returns 'downloaded', 'skipped', or 'failed'. Shared by the bulk
+    backfill and the live listener so both behave identically.
+    """
+    if not message.media:
+        return "skipped"
+
+    dest = target_filename(message, folder)
+    # Resume support: skip files already pulled (non-empty).
+    if dest.exists() and dest.stat().st_size > 0:
+        return "skipped"
+
+    bar = None
+    if tqdm is not None and message.file and message.file.size:
+        bar = tqdm(
+            total=message.file.size,
+            unit="B",
+            unit_scale=True,
+            desc=dest.name[:40],
+            leave=False,
+        )
+
+    def progress(received, total, _bar=bar):
+        if _bar is not None:
+            _bar.update(received - _bar.n)
+
+    try:
+        await client.download_media(message, file=str(dest),
+                                    progress_callback=progress)
+        return "downloaded"
+    except FloodWaitError as e:
+        # Telegram asked us to slow down; honor it and retry once.
+        if bar:
+            bar.close()
+            bar = None
+        print(f"  rate-limited, waiting {e.seconds}s ...")
+        await asyncio.sleep(e.seconds + 1)
+        try:
+            await client.download_media(message, file=str(dest))
+            return "downloaded"
+        except Exception as e2:  # noqa: BLE001
+            print(f"  failed msg {message.id}: {e2}")
+            return "failed"
+    except Exception as e:  # noqa: BLE001
+        # Clean up any partial file so the next run retries it.
+        if dest.exists() and dest.stat().st_size == 0:
+            dest.unlink(missing_ok=True)
+        print(f"  failed msg {message.id}: {e}")
+        return "failed"
+    finally:
+        if bar:
+            bar.close()
+
+
+async def download_channel(client, entity, out_root, limit):
+    folder = channel_folder(entity, out_root)
     title = getattr(entity, "title", str(entity.id))
     print(f"\n=== {title} -> {folder} ===")
 
-    downloaded = skipped = failed = 0
+    counts = {"downloaded": 0, "skipped": 0, "failed": 0}
     async for message in client.iter_messages(entity, limit=limit):
         if not message.media:
             continue
+        counts[await download_one(client, message, folder)] += 1
 
-        dest = target_filename(message, folder)
-        # Resume support: skip files already pulled (non-empty).
-        if dest.exists() and dest.stat().st_size > 0:
-            skipped += 1
-            continue
+    print(f"  done: {counts['downloaded']} downloaded, "
+          f"{counts['skipped']} already had, {counts['failed']} failed")
+    return counts["downloaded"], counts["skipped"], counts["failed"]
 
-        bar = None
-        if tqdm is not None and message.file and message.file.size:
-            bar = tqdm(
-                total=message.file.size,
-                unit="B",
-                unit_scale=True,
-                desc=dest.name[:40],
-                leave=False,
-            )
 
-        def progress(received, total, _bar=bar):
-            if _bar is not None:
-                _bar.update(received - _bar.n)
+async def listen_mode(client, entities, out_root):
+    """Stay connected and download new media as it's posted."""
+    # Pre-resolve each chat's folder so the handler is fast.
+    folders = {e.id: channel_folder(e, out_root) for e in entities}
+    names = ", ".join(getattr(e, "title", str(e.id)) for e in entities)
 
-        try:
-            await client.download_media(message, file=str(dest),
-                                        progress_callback=progress)
-            downloaded += 1
-        except FloodWaitError as e:
-            # Telegram asked us to slow down; honor it and retry once.
-            if bar:
-                bar.close()
-            print(f"  rate-limited, waiting {e.seconds}s ...")
-            await asyncio.sleep(e.seconds + 1)
-            try:
-                await client.download_media(message, file=str(dest))
-                downloaded += 1
-            except Exception as e2:  # noqa: BLE001
-                failed += 1
-                print(f"  failed msg {message.id}: {e2}")
-            continue
-        except Exception as e:  # noqa: BLE001
-            failed += 1
-            # Clean up any partial file so the next run retries it.
-            if dest.exists() and dest.stat().st_size == 0:
-                dest.unlink(missing_ok=True)
-            print(f"  failed msg {message.id}: {e}")
-        finally:
-            if bar:
-                bar.close()
+    @client.on(events.NewMessage(chats=entities))
+    async def handler(event):
+        if not event.message.media:
+            return
+        folder = folders.get(event.chat_id) or channel_folder(event.chat, out_root)
+        title = getattr(event.chat, "title", str(event.chat_id))
+        result = await download_one(client, event.message, folder)
+        if result == "downloaded":
+            print(f"[{title}] saved new file -> {folder}")
 
-    print(f"  done: {downloaded} downloaded, {skipped} already had, "
-          f"{failed} failed")
-    return downloaded, skipped, failed
+    print(f"\nListening for new files on: {names}")
+    print("Leave this running. New files download automatically. Ctrl+C to stop.")
+    await client.run_until_disconnected()
 
 
 async def main():
@@ -222,7 +258,11 @@ async def main():
     parser.add_argument("--all", action="store_true",
                         help="download from every channel/group, no prompt")
     parser.add_argument("--limit", type=int, default=None,
-                        help="max messages to scan per channel (default: all)")
+                        help="max messages to scan per channel (default: all; "
+                             "use 0 with --listen to skip old files)")
+    parser.add_argument("--listen", action="store_true",
+                        help="after grabbing history, keep running and "
+                             "auto-download new files as they're posted")
     parser.add_argument("--session", default="tg_downloader",
                         help="session name; keeps you logged in between runs")
     args = parser.parse_args()
@@ -244,19 +284,27 @@ async def main():
 
     targets = await pick_targets(client, args.all)
 
-    totals = [0, 0, 0]
-    for entity in targets:
-        try:
-            d, s, f = await download_channel(client, entity, out_root, args.limit)
-            totals[0] += d
-            totals[1] += s
-            totals[2] += f
-        except Exception as e:  # noqa: BLE001
-            print(f"  skipping channel ({e})")
+    # Backfill existing files first (unless --listen with --limit 0).
+    if not (args.listen and args.limit == 0):
+        totals = [0, 0, 0]
+        for entity in targets:
+            try:
+                d, s, f = await download_channel(client, entity, out_root,
+                                                 args.limit)
+                totals[0] += d
+                totals[1] += s
+                totals[2] += f
+            except Exception as e:  # noqa: BLE001
+                print(f"  skipping channel ({e})")
+        print(f"\nHistory done. {totals[0]} downloaded, {totals[1]} skipped, "
+              f"{totals[2]} failed. Files are in: {out_root}")
 
-    await client.disconnect()
-    print(f"\nAll finished. {totals[0]} downloaded, {totals[1]} skipped, "
-          f"{totals[2]} failed. Files are in: {out_root}")
+    if args.listen:
+        # Keep running; download new files as they arrive.
+        await listen_mode(client, targets, out_root)
+    else:
+        await client.disconnect()
+        print(f"All finished. Files are in: {out_root}")
 
 
 if __name__ == "__main__":

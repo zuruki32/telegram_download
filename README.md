@@ -61,6 +61,18 @@ python download.py -o ~/tg-archive    # choose where files go
 python download.py --limit 500        # only scan the newest 500 messages per channel
 ```
 
+## Listener mode (auto-download new files)
+
+Keep the app running so it downloads new files the moment they're posted:
+
+```bash
+python download.py --listen           # grab history, then watch for new files
+python download.py --listen --limit 0 # skip old files, only watch for new ones
+```
+
+Pick the channels when prompted, then leave the window open. Each new file
+is saved automatically into that channel's folder. Press Ctrl+C to stop.
+
 ## Good to know
 
 - **Resumable.** Re-run the same command and it skips files already saved,
