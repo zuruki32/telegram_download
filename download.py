@@ -854,6 +854,7 @@ async def download_channel(client, entity, out_root, limit, verify=False,
     last_id = 0           # resume point (messages come newest-first)
     remaining = limit     # None = all
     hiccups = 0
+    failed_ids = []       # files to retry before moving to the next channel
     while True:
         try:
             async for message in client.iter_messages(entity, offset_id=last_id,
@@ -864,9 +865,12 @@ async def download_channel(client, entity, out_root, limit, verify=False,
                 fname = message.file.name if message.file else None
                 sub = folder_for_file(message.message, fname, message.id)
                 dest_folder = root / sub
-                counts[await download_one(client, message, dest_folder, done,
-                                          ledger_path, have, verify, dedup,
-                                          force_ids, fast)] += 1
+                res = await download_one(client, message, dest_folder, done,
+                                         ledger_path, have, verify, dedup,
+                                         force_ids, fast)
+                counts[res] += 1
+                if res == "failed":
+                    failed_ids.append(message.id)
                 if remaining is not None:
                     remaining -= 1
             break   # finished the whole channel
@@ -881,6 +885,39 @@ async def download_channel(client, entity, out_root, limit, verify=False,
             print(f"  connection hiccup while listing ({e}); "
                   f"resuming from message {last_id} in 5s ...")
             await asyncio.sleep(5)
+
+    # Make sure the whole channel really finished: retry any files that failed
+    # before moving on to the next channel.
+    rounds = 0
+    while failed_ids and rounds < 3:
+        rounds += 1
+        retry_ids, failed_ids = failed_ids, []
+        print(f"  retrying {len(retry_ids)} failed file(s) "
+              f"(round {rounds}/3) ...")
+        try:
+            messages = await client.get_messages(entity, ids=retry_ids)
+        except Exception as e:  # noqa: BLE001
+            print(f"  could not refetch failed files ({e}); will get them "
+                  f"on the next run")
+            failed_ids = retry_ids
+            break
+        for message in messages:
+            if message is None or not message.media:
+                continue
+            fname = message.file.name if message.file else None
+            sub = folder_for_file(message.message, fname, message.id)
+            res = await download_one(client, message, root / sub, done,
+                                     ledger_path, have, verify, dedup,
+                                     force_ids, fast)
+            if res == "failed":
+                failed_ids.append(message.id)
+            else:
+                counts["failed"] -= 1
+                counts[res] = counts.get(res, 0) + 1
+        await asyncio.sleep(3)
+    if failed_ids:
+        print(f"  {len(failed_ids)} file(s) still failed after retries; "
+              f"re-run the app to pick them up.")
 
     if verify:
         rewrite_ledger(ledger_path, done)  # clean list matching real files
