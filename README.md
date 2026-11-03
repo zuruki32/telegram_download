@@ -61,6 +61,26 @@ python download.py -o ~/tg-archive    # choose where files go
 python download.py --limit 500        # only scan the newest 500 messages per channel
 ```
 
+## Download speed (parallel connections)
+
+On some routes each single connection is speed-throttled (common for
+Iran→Europe), so the default one-stream download is slow — and a proxy does
+**not** fix this, because the same data still goes over the same throttled
+link. The official Telegram app feels fast only because it uses many
+connections at once.
+
+This app does the same: it downloads each file over several parallel
+connections and adds them up, beating the per-connection cap. It's on by
+default (4 connections). Raise it for more speed:
+
+```bash
+python download.py --connections 8    # ~8x a single stream, if the link allows
+python download.py --connections 1    # old single-stream behaviour
+```
+
+If the parallel path ever fails for a file, it automatically falls back to a
+normal single-stream download, so downloads always still work.
+
 ## Using a proxy (no VPN)
 
 If Telegram is blocked on your network, connect the app through a proxy

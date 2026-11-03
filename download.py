@@ -33,6 +33,8 @@ try:
 except ImportError:  # progress bars are optional
     tqdm = None
 
+from fast_download import FastDownloader
+
 
 # File extensions we keep. Set from --ext in main; None means "everything".
 # Default is ebook/document formats so photos, videos, stickers and audio
@@ -662,8 +664,24 @@ def wanted(message):
     return message_ext(message) in ALLOWED_EXTS
 
 
+async def _fetch_media(client, message, part, progress, fast):
+    """Download one message's media to `part`, in parallel if possible."""
+    doc = getattr(message, "document", None)
+    size = message.file.size if message.file else 0
+    if fast is not None and doc is not None and size:
+        try:
+            with open(part, "wb") as fh:
+                await fast.download(doc, size, fh, progress=progress)
+            return
+        except Exception as e:  # noqa: BLE001 - fall back to single stream
+            print(f"  parallel download failed ({e}); using single stream")
+    await client.download_media(message, file=str(part),
+                                progress_callback=progress)
+
+
 async def download_one(client, message, folder, done=None, ledger_path=None,
-                       have=None, verify=False, dedup=None, force_ids=None):
+                       have=None, verify=False, dedup=None, force_ids=None,
+                       fast=None):
     """Download a single message's media into folder.
 
     Returns 'downloaded', 'skipped', 'filtered', 'duplicate', or 'failed'.
@@ -785,8 +803,7 @@ async def download_one(client, message, folder, done=None, ledger_path=None,
                 _bar.update(received - _bar.n)
 
         try:
-            await client.download_media(message, file=str(part),
-                                        progress_callback=progress)
+            await _fetch_media(client, message, part, progress, fast)
             return finish()
         except FloodWaitError as e:
             last_err = e
@@ -809,7 +826,7 @@ async def download_one(client, message, folder, done=None, ledger_path=None,
 
 
 async def download_channel(client, entity, out_root, limit, verify=False,
-                           dedup=None, force_ids=None):
+                           dedup=None, force_ids=None, fast=None):
     root = channel_folder(entity, out_root)
     done, ledger_path = load_ledger(root)
     # Index every file already on disk by its id/filename (a quick name scan,
@@ -832,7 +849,7 @@ async def download_channel(client, entity, out_root, limit, verify=False,
         dest_folder = root / sub
         counts[await download_one(client, message, dest_folder, done,
                                   ledger_path, have, verify, dedup,
-                                  force_ids)] += 1
+                                  force_ids, fast)] += 1
 
     if verify:
         rewrite_ledger(ledger_path, done)  # clean list matching real files
@@ -843,7 +860,8 @@ async def download_channel(client, entity, out_root, limit, verify=False,
     return counts["downloaded"], counts["skipped"], counts["failed"]
 
 
-async def listen_mode(client, entities, out_root, dedup=None, force_ids=None):
+async def listen_mode(client, entities, out_root, dedup=None, force_ids=None,
+                      fast=None):
     """Stay connected and download new media as it's posted."""
     folders = {e.id: channel_folder(e, out_root) for e in entities}
     names = ", ".join(getattr(e, "title", str(e.id)) for e in entities)
@@ -866,8 +884,8 @@ async def listen_mode(client, entities, out_root, dedup=None, force_ids=None):
             fname = m.file.name if m.file else None
             sub = folder_for_file(m.message or event.text, fname, m.id)
             dest_folder = root / sub
-            if await download_one(client, m, dest_folder, done, path,
-                                  have, False, dedup, force_ids) == "downloaded":
+            if await download_one(client, m, dest_folder, done, path, have,
+                                  False, dedup, force_ids, fast) == "downloaded":
                 print(f"[{title}] saved -> {dest_folder}")
 
     @client.on(events.NewMessage(chats=entities))
@@ -881,7 +899,7 @@ async def listen_mode(client, entities, out_root, dedup=None, force_ids=None):
         dest_folder = root / sub
         title = getattr(event.chat, "title", str(event.chat_id))
         if await download_one(client, event.message, dest_folder, done, path,
-                              have, False, dedup, force_ids) == "downloaded":
+                              have, False, dedup, force_ids, fast) == "downloaded":
             print(f"[{title}] saved -> {dest_folder}")
 
     print(f"\nListening for new files on: {names}")
@@ -937,6 +955,10 @@ async def main():
                         help="don't download; just print caption + filename "
                              "+ chosen folder for the first N files "
                              "(for debugging folder names)")
+    parser.add_argument("--connections", type=int, default=4, metavar="N",
+                        help="parallel connections per file to beat a "
+                             "per-connection speed throttle (default 4; "
+                             "use 1 for the old single-stream behaviour)")
     parser.add_argument("--proxy", default="",
                         help="proxy to connect through (works without a VPN): "
                              "a t.me/proxy MTProto link, mtproxy://host:port:secret, "
@@ -993,6 +1015,12 @@ async def main():
           f"(@{me.username})" if me.username else f"Logged in as {me.first_name}")
 
     targets = await pick_targets(client, args.all, reset=args.reset_channels)
+
+    # Parallel downloader to beat a per-connection speed throttle.
+    fast = None
+    if args.connections > 1:
+        fast = FastDownloader(client, connections=args.connections)
+        print(f"Parallel download: {args.connections} connections per file.")
 
     # Message ids to force-download even if dedup would skip them.
     force_ids = set()
@@ -1060,7 +1088,8 @@ async def main():
             try:
                 d, s, f = await download_channel(client, entity, out_root,
                                                  args.limit, verify=args.verify,
-                                                 dedup=dedup, force_ids=force_ids)
+                                                 dedup=dedup, force_ids=force_ids,
+                                                 fast=fast)
                 totals[0] += d
                 totals[1] += s
                 totals[2] += f
@@ -1072,8 +1101,10 @@ async def main():
     if args.listen:
         # Keep running; download new files as they arrive.
         await listen_mode(client, targets, out_root, dedup=dedup,
-                          force_ids=force_ids)
+                          force_ids=force_ids, fast=fast)
     else:
+        if fast is not None:
+            await fast.close()
         await client.disconnect()
         print(f"All finished. Files are in: {out_root}")
 
