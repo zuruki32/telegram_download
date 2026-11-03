@@ -75,10 +75,17 @@ is saved automatically into that channel's folder. Press Ctrl+C to stop.
 
 ## Good to know
 
-- **Resumable.** Re-run the same command and it skips files already saved,
-  so you can stop (Ctrl+C) and continue later.
-- **Organized.** Each channel gets its own folder; files are prefixed with
-  their message id so order is preserved and names never collide.
+- **A folder per novel.** Inside each channel's folder, files are grouped by
+  their caption (the novel/book title) into subfolders — albums posted
+  together, or single files with a title, each get their own folder:
+  `downloads/<channel>/<novel title>/...`. Files with no caption stay in the
+  channel folder.
+- **Resumable with a ledger.** Each channel folder has a `_completed.txt`
+  listing every file already saved (message id + name). On restart the app
+  reads it and skips what's done, so stopping (Ctrl+C) and re-running never
+  starts over. It also double-checks the files on disk as a backup.
+- **Organized naming.** Files are prefixed with their message id so order is
+  preserved and names never collide.
 - **Rate limits.** Telegram throttles bulk downloads; the tool waits
   automatically when asked, so large channels just take a while.
 

@@ -157,18 +157,72 @@ def channel_folder(entity, out_root):
     return folder
 
 
-async def download_one(client, message, folder):
+# ---------------------------------------------------------------------------
+# Resume ledger
+# ---------------------------------------------------------------------------
+# Each channel folder keeps a "_completed.txt" listing every message id
+# already saved (with the file name, for your eyes). On restart we read it
+# and skip what's done, so a stopped run never starts over.
+LEDGER_NAME = "_completed.txt"
+
+
+def load_ledger(channel_root):
+    """Return (set_of_done_message_ids, path_to_ledger)."""
+    path = channel_root / LEDGER_NAME
+    done = set()
+    if path.exists():
+        try:
+            for line in path.read_text(encoding="utf-8").splitlines():
+                token = line.strip().split("\t", 1)[0].strip()
+                if token.isdigit():
+                    done.add(int(token))
+        except Exception:  # noqa: BLE001 - a bad ledger shouldn't stop us
+            pass
+    return done, path
+
+
+def record_done(done, ledger_path, message_id, name):
+    """Mark a message as finished, in memory and in the ledger file."""
+    if done is not None:
+        done.add(message_id)
+    if ledger_path is not None:
+        try:
+            with open(ledger_path, "a", encoding="utf-8") as f:
+                f.write(f"{message_id}\t{name}\n")
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def caption_subfolder(caption):
+    """Folder name for a novel, taken from the first line of its caption.
+
+    Empty string means 'no caption' -> file stays in the channel folder.
+    """
+    caption = (caption or "").strip()
+    if not caption:
+        return ""
+    return safe_name(caption.splitlines()[0].strip(), "")
+
+
+async def download_one(client, message, folder, done=None, ledger_path=None):
     """Download a single message's media into folder.
 
     Returns 'downloaded', 'skipped', or 'failed'. Shared by the bulk
-    backfill and the live listener so both behave identically.
+    backfill and the live listener so both behave identically. `done` /
+    `ledger_path` are the channel-level resume ledger.
     """
     if not message.media:
         return "skipped"
 
+    # Fast skip: the ledger already says this one is done.
+    if done is not None and message.id in done:
+        return "skipped"
+
+    folder.mkdir(parents=True, exist_ok=True)
     dest = target_filename(message, folder)
-    # Resume support: skip files already pulled (non-empty).
+    # Backup skip: the file is already on disk (ledger lost or first run).
     if dest.exists() and dest.stat().st_size > 0:
+        record_done(done, ledger_path, message.id, dest.name)
         return "skipped"
 
     bar = None
@@ -188,6 +242,7 @@ async def download_one(client, message, folder):
     try:
         await client.download_media(message, file=str(dest),
                                     progress_callback=progress)
+        record_done(done, ledger_path, message.id, dest.name)
         return "downloaded"
     except FloodWaitError as e:
         # Telegram asked us to slow down; honor it and retry once.
@@ -198,6 +253,7 @@ async def download_one(client, message, folder):
         await asyncio.sleep(e.seconds + 1)
         try:
             await client.download_media(message, file=str(dest))
+            record_done(done, ledger_path, message.id, dest.name)
             return "downloaded"
         except Exception as e2:  # noqa: BLE001
             print(f"  failed msg {message.id}: {e2}")
@@ -214,15 +270,44 @@ async def download_one(client, message, folder):
 
 
 async def download_channel(client, entity, out_root, limit):
-    folder = channel_folder(entity, out_root)
+    root = channel_folder(entity, out_root)
+    done, ledger_path = load_ledger(root)
     title = getattr(entity, "title", str(entity.id))
-    print(f"\n=== {title} -> {folder} ===")
+    print(f"\n=== {title} -> {root} ===")
 
     counts = {"downloaded": 0, "skipped": 0, "failed": 0}
+    album = []          # messages of the album currently being collected
+    album_gid = None    # grouped_id of that album
+
+    async def flush():
+        # Download the buffered album into one subfolder named after its
+        # caption (the novel title). Standalone posts flush as a group of 1.
+        if not album:
+            return
+        caption = ""
+        for m in album:
+            text = (m.message or "").strip()
+            if text:
+                caption = text
+                break
+        sub = caption_subfolder(caption)
+        dest_folder = root / sub if sub else root
+        for m in album:
+            counts[await download_one(client, m, dest_folder,
+                                      done, ledger_path)] += 1
+        album.clear()
+
     async for message in client.iter_messages(entity, limit=limit):
         if not message.media:
             continue
-        counts[await download_one(client, message, folder)] += 1
+        gid = getattr(message, "grouped_id", None)
+        if gid is not None and gid == album_gid:
+            album.append(message)       # same album, keep collecting
+            continue
+        await flush()                   # new album/post -> save the last one
+        album_gid = gid
+        album.append(message)
+    await flush()
 
     print(f"  done: {counts['downloaded']} downloaded, "
           f"{counts['skipped']} already had, {counts['failed']} failed")
@@ -231,19 +316,41 @@ async def download_channel(client, entity, out_root, limit):
 
 async def listen_mode(client, entities, out_root):
     """Stay connected and download new media as it's posted."""
-    # Pre-resolve each chat's folder so the handler is fast.
     folders = {e.id: channel_folder(e, out_root) for e in entities}
     names = ", ".join(getattr(e, "title", str(e.id)) for e in entities)
+    ledgers = {}  # chat_id -> (root, done_set, ledger_path)
+
+    def ledger_for(chat_id, chat):
+        if chat_id not in ledgers:
+            root = folders.get(chat_id) or channel_folder(chat, out_root)
+            done, path = load_ledger(root)
+            ledgers[chat_id] = (root, done, path)
+        return ledgers[chat_id]
+
+    @client.on(events.Album(chats=entities))
+    async def on_album(event):
+        # A whole novel posted as one album -> its own subfolder.
+        root, done, path = ledger_for(event.chat_id, event.chat)
+        sub = caption_subfolder(event.text)
+        dest_folder = root / sub if sub else root
+        title = getattr(event.chat, "title", str(event.chat_id))
+        for m in event.messages:
+            if m.media and await download_one(client, m, dest_folder,
+                                              done, path) == "downloaded":
+                print(f"[{title}] saved -> {dest_folder}")
 
     @client.on(events.NewMessage(chats=entities))
-    async def handler(event):
-        if not event.message.media:
+    async def on_message(event):
+        # Album parts are handled by on_album; skip them here.
+        if event.message.grouped_id or not event.message.media:
             return
-        folder = folders.get(event.chat_id) or channel_folder(event.chat, out_root)
+        root, done, path = ledger_for(event.chat_id, event.chat)
+        sub = caption_subfolder(event.message.message)
+        dest_folder = root / sub if sub else root
         title = getattr(event.chat, "title", str(event.chat_id))
-        result = await download_one(client, event.message, folder)
-        if result == "downloaded":
-            print(f"[{title}] saved new file -> {folder}")
+        if await download_one(client, event.message, dest_folder,
+                              done, path) == "downloaded":
+            print(f"[{title}] saved -> {dest_folder}")
 
     print(f"\nListening for new files on: {names}")
     print("Leave this running. New files download automatically. Ctrl+C to stop.")
