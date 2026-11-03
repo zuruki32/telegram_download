@@ -28,9 +28,11 @@ from telethon.tl.functions.upload import GetFileRequest
 class FastDownloader:
     """Reusable pool of parallel download connections, per data center."""
 
-    def __init__(self, client, connections=4, retries=10, retry_delay=3):
+    def __init__(self, client, connections=4, retries=2, retry_delay=2):
         self.client = client
         self.connections = max(1, int(connections))
+        # Telethon's _call already retries internally, so keep this small:
+        # a couple of tries, then let the caller fall back to single stream.
         self.retries = max(1, int(retries))
         self.retry_delay = retry_delay
         self._senders = {}     # dc_id -> [MTProtoSender, ...]
@@ -99,15 +101,13 @@ class FastDownloader:
                 for i in range(n)]
         downloaded = 0
         done = 0
+        batch = []
         try:
             while done < part_count:
                 # Fire one request per connection at once, collect in order.
-                batch = []
-                for i in range(n):
-                    if done + i < part_count:
-                        batch.append(
-                            (i, asyncio.ensure_future(
-                                self._call_retry(senders[i], reqs[i]))))
+                batch = [(i, asyncio.ensure_future(
+                            self._call_retry(senders[i], reqs[i])))
+                         for i in range(n) if done + i < part_count]
                 for i, fut in batch:
                     result = await fut
                     data = result.bytes
@@ -120,8 +120,17 @@ class FastDownloader:
                                 await r
                     reqs[i].offset += stride
                 done += len(batch)
+                batch = []
         except Exception:
-            # A pooled connection may have died; rebuild it next time.
+            # One chunk failed: cancel and drain the rest of this batch so
+            # their failures aren't reported as "Task exception never retrieved",
+            # then drop the (maybe-dead) pool so it's rebuilt next time.
+            for _, fut in batch:
+                if not fut.done():
+                    fut.cancel()
+            if batch:
+                await asyncio.gather(*(f for _, f in batch),
+                                     return_exceptions=True)
             await self._drop(dc_id)
             raise
         return downloaded

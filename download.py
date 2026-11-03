@@ -1148,7 +1148,7 @@ async def main():
     fast = None
     if args.connections > 1:
         fast = FastDownloader(client, connections=args.connections,
-                              retries=args.retries, retry_delay=3)
+                              retries=2, retry_delay=2)
         print(f"Parallel download: {args.connections} connections per file.")
 
     # Message ids to force-download even if dedup would skip them.
