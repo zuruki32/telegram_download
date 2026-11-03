@@ -549,14 +549,12 @@ class Dedup:
             self.title_exts.setdefault(base, set()).add(ext)
 
 
-def build_dedup(out_root, by_size, by_title):
-    """Index size, base title and format of every file already on disk, across
-    all channels (so a channel file also posted in its linked group, the same
-    file renamed, or the same book in another format, isn't downloaded again).
-    """
+def build_dedup(root, by_size, by_title):
+    """Index size, base title and format of files already in `root` (one
+    channel's folder), so that channel isn't given the same file twice."""
     dd = Dedup(by_size, by_title)
-    if out_root.exists():
-        for p in out_root.rglob("*"):
+    if root.exists():
+        for p in root.rglob("*"):
             if (not p.is_file() or p.name == LEDGER_NAME
                     or p.name.endswith(".part") or not _ID_PREFIX.match(p.name)):
                 continue
@@ -564,6 +562,16 @@ def build_dedup(out_root, by_size, by_title):
                 dd.add(p.stat().st_size, base_title(p.name), _ext_of(p.name))
             except Exception:  # noqa: BLE001
                 pass
+    return dd
+
+
+def make_dedup(root, dedup_opts):
+    """Build a per-channel Dedup from (by_size, by_title, skip_log), or None."""
+    if dedup_opts is None:
+        return None
+    by_size, by_title, skip_log = dedup_opts
+    dd = build_dedup(root, by_size, by_title)
+    dd.skip_log = skip_log
     return dd
 
 
@@ -834,7 +842,7 @@ async def download_one(client, message, folder, done=None, ledger_path=None,
 
 
 async def download_channel(client, entity, out_root, limit, verify=False,
-                           dedup=None, force_ids=None, fast=None):
+                           dedup_opts=None, force_ids=None, fast=None):
     root = channel_folder(entity, out_root)
     done, ledger_path = load_ledger(root)
     # Index every file already on disk by its id/filename (a quick name scan,
@@ -842,6 +850,7 @@ async def download_channel(client, entity, out_root, limit, verify=False,
     # so it works no matter which folder a file is in or what the log says.
     # --verify additionally reads each file to check it isn't corrupt.
     have = scan_existing(root)
+    dedup = make_dedup(root, dedup_opts)   # per-channel duplicate index
     title = getattr(entity, "title", str(entity.id))
     note = f" (verifying {len(have)} on disk)" if verify else \
            f" ({len(have)} already on disk)"
@@ -929,23 +938,24 @@ async def download_channel(client, entity, out_root, limit, verify=False,
     return counts["downloaded"], counts["skipped"], counts["failed"]
 
 
-async def listen_mode(client, entities, out_root, dedup=None, force_ids=None,
-                      fast=None):
+async def listen_mode(client, entities, out_root, dedup_opts=None,
+                      force_ids=None, fast=None):
     """Stay connected and download new media as it's posted."""
     folders = {e.id: channel_folder(e, out_root) for e in entities}
     names = ", ".join(getattr(e, "title", str(e.id)) for e in entities)
-    ledgers = {}  # chat_id -> (root, done, ledger_path, have)
+    ledgers = {}  # chat_id -> (root, done, ledger_path, have, dedup)
 
     def ledger_for(chat_id, chat):
         if chat_id not in ledgers:
             root = folders.get(chat_id) or channel_folder(chat, out_root)
             done, path = load_ledger(root)
-            ledgers[chat_id] = (root, done, path, scan_existing(root))
+            ledgers[chat_id] = (root, done, path, scan_existing(root),
+                                make_dedup(root, dedup_opts))
         return ledgers[chat_id]
 
     @client.on(events.Album(chats=entities))
     async def on_album(event):
-        root, done, path, have = ledger_for(event.chat_id, event.chat)
+        root, done, path, have, dedup = ledger_for(event.chat_id, event.chat)
         title = getattr(event.chat, "title", str(event.chat_id))
         for m in event.messages:
             if not m.media:
@@ -962,7 +972,7 @@ async def listen_mode(client, entities, out_root, dedup=None, force_ids=None,
         # Album parts are handled by on_album; skip them here.
         if event.message.grouped_id or not event.message.media:
             return
-        root, done, path, have = ledger_for(event.chat_id, event.chat)
+        root, done, path, have, dedup = ledger_for(event.chat_id, event.chat)
         fname = event.message.file.name if event.message.file else None
         sub = folder_for_file(event.message.message, fname, event.message.id)
         dest_folder = root / sub
@@ -1111,29 +1121,27 @@ async def main():
     if force_ids:
         print(f"Force-downloading {len(force_ids)} id(s) regardless of dedup.")
 
-    # Build the duplicate index from everything already on disk (all folders),
-    # so a file reposted in a linked group, or the same book renamed, isn't
-    # downloaded twice. Shared across channels and the listener, updated live.
-    dedup = None
+    # Duplicate check is PER CHANNEL: each channel builds its own index from
+    # its own folder, so a channel never holds the same file twice, but the
+    # same book can still exist in different channels (you compare those
+    # yourself). dedup_opts carries the settings; the index is built per
+    # channel inside download_channel / the listener.
+    dedup_opts = None
     if not args.no_dedup or args.dedup_formats:
-        dedup = build_dedup(out_root, by_size=not args.no_dedup,
-                            by_title=args.dedup_formats)
-        # Fresh skip list for this run, so you can review what got skipped.
         skip_log = out_root / "_skipped.txt"
         try:
             skip_log.write_text("# message_id\tchannel\treason\tfilename\n"
                                 "# re-download a wrongly-skipped one with: "
                                 "--force-ids <id,id,...>\n", encoding="utf-8")
-            dedup.skip_log = skip_log
         except Exception:  # noqa: BLE001
-            pass
+            skip_log = None
+        dedup_opts = (not args.no_dedup, args.dedup_formats, skip_log)
         bits = []
         if not args.no_dedup:
             bits.append("same size")
         if args.dedup_formats:
             bits.append("same title")
-        print(f"Duplicate check: on ({', '.join(bits)}); "
-              f"{len(dedup.sizes)} files indexed. "
+        print(f"Duplicate check: per channel ({', '.join(bits)}). "
               f"Skips listed in {skip_log}")
     else:
         print("Duplicate check: off.")
@@ -1169,8 +1177,8 @@ async def main():
             try:
                 d, s, f = await download_channel(client, entity, out_root,
                                                  args.limit, verify=args.verify,
-                                                 dedup=dedup, force_ids=force_ids,
-                                                 fast=fast)
+                                                 dedup_opts=dedup_opts,
+                                                 force_ids=force_ids, fast=fast)
                 totals[0] += d
                 totals[1] += s
                 totals[2] += f
@@ -1181,7 +1189,7 @@ async def main():
 
     if args.listen:
         # Keep running; download new files as they arrive.
-        await listen_mode(client, targets, out_root, dedup=dedup,
+        await listen_mode(client, targets, out_root, dedup_opts=dedup_opts,
                           force_ids=force_ids, fast=fast)
     else:
         if fast is not None:
