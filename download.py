@@ -42,6 +42,9 @@ from fast_download import FastDownloader
 ALLOWED_EXTS = {"pdf", "epub", "mobi", "azw3", "azw", "djvu", "fb2",
                 "cbz", "cbr", "doc", "docx", "zip", "rar", "7z"}
 
+# Skip files larger than this many bytes (set from --max-size). 0 = no limit.
+MAX_SIZE = 0
+
 # Archive types we can unpack after downloading (when extraction is on).
 ARCHIVE_EXTS = {"zip", "rar", "7z"}
 EXTRACT = True           # set from --no-extract in main
@@ -699,6 +702,11 @@ async def download_one(client, message, folder, done=None, ledger_path=None,
     if not wanted(message):
         return "filtered"
 
+    # Too big (e.g. a huge comic/pdf or a video wrapped in a zip).
+    if MAX_SIZE and message.file and message.file.size \
+            and message.file.size > MAX_SIZE:
+        return "toobig"
+
     root = ledger_path.parent if ledger_path is not None else folder
 
     # Already downloaded somewhere under this channel (any folder layout)?
@@ -840,7 +848,7 @@ async def download_channel(client, entity, out_root, limit, verify=False,
     print(f"\n=== {title} -> {root}{note} ===")
 
     counts = {"downloaded": 0, "skipped": 0, "filtered": 0,
-              "duplicate": 0, "failed": 0}
+              "duplicate": 0, "toobig": 0, "failed": 0}
     async for message in client.iter_messages(entity, limit=limit):
         if not message.media:
             continue
@@ -856,7 +864,8 @@ async def download_channel(client, entity, out_root, limit, verify=False,
 
     print(f"  done: {counts['downloaded']} downloaded, "
           f"{counts['skipped']} already had, {counts['duplicate']} duplicates, "
-          f"{counts['filtered']} wrong type, {counts['failed']} failed")
+          f"{counts['filtered']} wrong type, {counts['toobig']} too big, "
+          f"{counts['failed']} failed")
     return counts["downloaded"], counts["skipped"], counts["failed"]
 
 
@@ -908,7 +917,7 @@ async def listen_mode(client, entities, out_root, dedup=None, force_ids=None,
 
 
 async def main():
-    global ALLOWED_EXTS, EXTRACT, DELETE_ARCHIVES
+    global ALLOWED_EXTS, EXTRACT, DELETE_ARCHIVES, MAX_SIZE
     parser = argparse.ArgumentParser(
         description="Download media files from Telegram channels you joined.")
     parser.add_argument("-o", "--out", default="downloads",
@@ -928,6 +937,9 @@ async def main():
     parser.add_argument("--all-types", action="store_true",
                         help="download every file type, no filtering "
                              "(photos, videos, everything)")
+    parser.add_argument("--max-size", type=float, default=0, metavar="MB",
+                        help="skip files larger than this many MB "
+                             "(e.g. --max-size 50); 0 = no limit")
     parser.add_argument("--no-extract", action="store_true",
                         help="don't auto-unpack downloaded zip/rar/7z archives")
     parser.add_argument("--delete-archives", action="store_true",
@@ -975,6 +987,9 @@ async def main():
 
     EXTRACT = not args.no_extract
     DELETE_ARCHIVES = args.delete_archives
+    MAX_SIZE = int(args.max_size * 1024 * 1024) if args.max_size else 0
+    if MAX_SIZE:
+        print(f"Skipping files larger than {args.max_size:g} MB.")
 
     # Decide which file types to keep.
     if args.all_types:

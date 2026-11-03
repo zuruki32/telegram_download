@@ -126,6 +126,14 @@ python download.py --ext pdf,epub     # keep only these types
 python download.py --all-types        # download everything, no filtering
 ```
 
+Videos and photos are skipped by extension. But a large file of an *allowed*
+type (e.g. a 200 MB comic pdf, or a video wrapped in a zip) still counts. To
+cap size:
+
+```bash
+python download.py --max-size 50      # skip any file larger than 50 MB
+```
+
 ## One-time verify (reconcile what you already downloaded)
 
 If you downloaded files with older versions (folders may be named
