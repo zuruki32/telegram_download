@@ -2,4 +2,5 @@ telethon==1.36.0
 tqdm==4.66.5
 py7zr==0.21.1
 rarfile==4.2
+python-socks[asyncio]>=2.4.3
 PySocks>=1.7.1

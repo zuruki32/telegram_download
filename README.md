@@ -124,9 +124,11 @@ TG_PROXY=https://t.me/proxy?server=HOST&port=PORT&secret=SECRET
 ```
 
 Notes:
-- MTProto proxies need no extra setup. SOCKS/HTTP use the `PySocks`
-  package (already in `requirements.txt`). Do **not** `pip install socks` —
-  that's a different, empty package; the right one is `PySocks`.
+- MTProto proxies need no extra setup. SOCKS/HTTP need `python-socks`
+  (async — the important one; without it Telethon falls back to a
+  synchronous SOCKS that can hang on a slow link). Both `python-socks` and
+  `PySocks` are in `requirements.txt`. Do **not** `pip install socks` —
+  that's a different, empty package.
 - Get a working MTProto proxy from the proxy channels people share on
   Telegram, or run your own; the app can't provide one for you.
 
