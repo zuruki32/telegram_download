@@ -442,7 +442,7 @@ async def download_one(client, message, folder, done=None, ledger_path=None):
 
     def finish():
         part.replace(dest)
-        record_done(done, ledger_path, message.id, rel)
+        saved_rel = rel
         if EXTRACT and message_ext(message) in ARCHIVE_EXTS:
             if extract_archive(dest):
                 print(f"  extracted {dest.name}")
@@ -450,8 +450,16 @@ async def download_one(client, message, folder, done=None, ledger_path=None):
                     try:
                         dest.unlink()
                         print(f"  removed archive {dest.name}")
+                        # Archive is gone; record the extracted folder so the
+                        # existence check doesn't re-download it every run.
+                        extracted = dest.with_suffix("")
+                        try:
+                            saved_rel = str(extracted.relative_to(root))
+                        except ValueError:
+                            saved_rel = extracted.name
                     except Exception as e:  # noqa: BLE001
                         print(f"  could not remove {dest.name}: {e}")
+        record_done(done, ledger_path, message.id, saved_rel)
         return "downloaded"
 
     last_err = None
