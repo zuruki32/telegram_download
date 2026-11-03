@@ -463,6 +463,18 @@ class Dedup:
         self.by_title = by_title
         self.sizes = set()
         self.title_exts = {}   # base title -> set of extensions seen
+        self.skip_log = None   # path to write skipped-as-duplicate rows
+        self.skipped = 0
+
+    def record_skip(self, msg_id, channel, reason, name):
+        self.skipped += 1
+        if not self.skip_log:
+            return
+        try:
+            with open(self.skip_log, "a", encoding="utf-8") as f:
+                f.write(f"{msg_id}\t{channel}\t{reason}\t{name}\n")
+        except Exception:  # noqa: BLE001
+            pass
 
     def why_duplicate(self, size, base, ext):
         if self.by_size and size and size in self.sizes:
@@ -599,15 +611,17 @@ def wanted(message):
 
 
 async def download_one(client, message, folder, done=None, ledger_path=None,
-                       have=None, verify=False, dedup=None):
+                       have=None, verify=False, dedup=None, force_ids=None):
     """Download a single message's media into folder.
 
     Returns 'downloaded', 'skipped', 'filtered', 'duplicate', or 'failed'.
     `done`/`ledger_path` are the channel resume ledger; `have` maps message
     ids to files already on disk; `verify` re-checks those aren't corrupt;
-    `dedup` skips files whose content (size) we already have elsewhere.
+    `dedup` skips files whose content (size) we already have elsewhere;
+    `force_ids` are message ids to download even if dedup would skip them.
     """
-    force = False  # set when re-downloading a corrupt file (bypasses dedup)
+    # force bypasses dedup (used for corrupt re-downloads and --force-ids).
+    force = bool(force_ids) and message.id in force_ids
     if not message.media:
         return "skipped"
 
@@ -674,6 +688,7 @@ async def download_one(client, message, folder, done=None, ledger_path=None,
         why = dedup.why_duplicate(size, base_title(fname), message_ext(message))
         if why:
             print(f"  duplicate ({why}), skipping: {dest.name}")
+            dedup.record_skip(message.id, root.name, why, dest.name)
             return "duplicate"
 
     # Download to a temporary .part file and only rename it into place when
@@ -742,7 +757,7 @@ async def download_one(client, message, folder, done=None, ledger_path=None,
 
 
 async def download_channel(client, entity, out_root, limit, verify=False,
-                           dedup=None):
+                           dedup=None, force_ids=None):
     root = channel_folder(entity, out_root)
     done, ledger_path = load_ledger(root)
     # Index every file already on disk by its id/filename (a quick name scan,
@@ -763,8 +778,9 @@ async def download_channel(client, entity, out_root, limit, verify=False,
         fname = message.file.name if message.file else None
         sub = folder_for_file(message.message, fname, message.id)
         dest_folder = root / sub
-        counts[await download_one(client, message, dest_folder,
-                                  done, ledger_path, have, verify, dedup)] += 1
+        counts[await download_one(client, message, dest_folder, done,
+                                  ledger_path, have, verify, dedup,
+                                  force_ids)] += 1
 
     if verify:
         rewrite_ledger(ledger_path, done)  # clean list matching real files
@@ -775,7 +791,7 @@ async def download_channel(client, entity, out_root, limit, verify=False,
     return counts["downloaded"], counts["skipped"], counts["failed"]
 
 
-async def listen_mode(client, entities, out_root, dedup=None):
+async def listen_mode(client, entities, out_root, dedup=None, force_ids=None):
     """Stay connected and download new media as it's posted."""
     folders = {e.id: channel_folder(e, out_root) for e in entities}
     names = ", ".join(getattr(e, "title", str(e.id)) for e in entities)
@@ -799,7 +815,7 @@ async def listen_mode(client, entities, out_root, dedup=None):
             sub = folder_for_file(m.message or event.text, fname, m.id)
             dest_folder = root / sub
             if await download_one(client, m, dest_folder, done, path,
-                                  have, False, dedup) == "downloaded":
+                                  have, False, dedup, force_ids) == "downloaded":
                 print(f"[{title}] saved -> {dest_folder}")
 
     @client.on(events.NewMessage(chats=entities))
@@ -813,7 +829,7 @@ async def listen_mode(client, entities, out_root, dedup=None):
         dest_folder = root / sub
         title = getattr(event.chat, "title", str(event.chat_id))
         if await download_one(client, event.message, dest_folder, done, path,
-                              have, False, dedup) == "downloaded":
+                              have, False, dedup, force_ids) == "downloaded":
             print(f"[{title}] saved -> {dest_folder}")
 
     print(f"\nListening for new files on: {names}")
@@ -862,6 +878,9 @@ async def main():
                         help="also skip a book you already have in another "
                              "format (same title); best-effort, may skip "
                              "differently-named editions")
+    parser.add_argument("--force-ids", default="",
+                        help="comma-separated message ids to download even if "
+                             "they'd be skipped as duplicates (from _skipped.txt)")
     parser.add_argument("--inspect", type=int, default=0, metavar="N",
                         help="don't download; just print caption + filename "
                              "+ chosen folder for the first N files "
@@ -910,6 +929,14 @@ async def main():
 
     targets = await pick_targets(client, args.all, reset=args.reset_channels)
 
+    # Message ids to force-download even if dedup would skip them.
+    force_ids = set()
+    for part in args.force_ids.replace(" ", "").split(","):
+        if part.isdigit():
+            force_ids.add(int(part))
+    if force_ids:
+        print(f"Force-downloading {len(force_ids)} id(s) regardless of dedup.")
+
     # Build the duplicate index from everything already on disk (all folders),
     # so a file reposted in a linked group, or the same book renamed, isn't
     # downloaded twice. Shared across channels and the listener, updated live.
@@ -917,13 +944,23 @@ async def main():
     if not args.no_dedup or args.dedup_formats:
         dedup = build_dedup(out_root, by_size=not args.no_dedup,
                             by_title=args.dedup_formats)
+        # Fresh skip list for this run, so you can review what got skipped.
+        skip_log = out_root / "_skipped.txt"
+        try:
+            skip_log.write_text("# message_id\tchannel\treason\tfilename\n"
+                                "# re-download a wrongly-skipped one with: "
+                                "--force-ids <id,id,...>\n", encoding="utf-8")
+            dedup.skip_log = skip_log
+        except Exception:  # noqa: BLE001
+            pass
         bits = []
         if not args.no_dedup:
             bits.append("same size")
         if args.dedup_formats:
             bits.append("same title")
         print(f"Duplicate check: on ({', '.join(bits)}); "
-              f"{len(dedup.sizes)} files indexed.")
+              f"{len(dedup.sizes)} files indexed. "
+              f"Skips listed in {skip_log}")
     else:
         print("Duplicate check: off.")
 
@@ -958,7 +995,7 @@ async def main():
             try:
                 d, s, f = await download_channel(client, entity, out_root,
                                                  args.limit, verify=args.verify,
-                                                 dedup=dedup)
+                                                 dedup=dedup, force_ids=force_ids)
                 totals[0] += d
                 totals[1] += s
                 totals[2] += f
@@ -969,7 +1006,8 @@ async def main():
 
     if args.listen:
         # Keep running; download new files as they arrive.
-        await listen_mode(client, targets, out_root, dedup=dedup)
+        await listen_mode(client, targets, out_root, dedup=dedup,
+                          force_ids=force_ids)
     else:
         await client.disconnect()
         print(f"All finished. Files are in: {out_root}")

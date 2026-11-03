@@ -130,6 +130,18 @@ Linked groups: just pick the group in the channel list like any other chat.
 Its copies of the channel's files are skipped by the size check, so they
 aren't downloaded again.
 
+### Reviewing skips
+
+Every file skipped as a duplicate is written to `downloads/_skipped.txt`
+(rebuilt each run) with its message id, channel, reason, and filename. Look
+through it, and if something was skipped by mistake, download it by its id:
+
+```bash
+python download.py --force-ids 200,214,377
+```
+
+Those ids download even if dedup would skip them.
+
 ## Remembered channels
 
 The first time you pick channels, your choice is saved to
