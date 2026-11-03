@@ -36,7 +36,7 @@ except ImportError:  # progress bars are optional
 # Default is ebook/document formats so photos, videos, stickers and audio
 # are skipped.
 ALLOWED_EXTS = {"pdf", "epub", "mobi", "azw3", "azw", "djvu", "fb2",
-                "cbz", "cbr", "doc", "docx"}
+                "cbz", "cbr", "doc", "docx", "zip", "rar", "7z"}
 
 
 # ---------------------------------------------------------------------------

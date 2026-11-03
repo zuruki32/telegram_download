@@ -65,7 +65,7 @@ python download.py --limit 500        # only scan the newest 500 messages per ch
 
 By default it downloads **only ebook/document files** and skips photos,
 videos, stickers and audio. The default types are:
-`pdf, epub, mobi, azw3, azw, djvu, fb2, cbz, cbr, doc, docx`.
+`pdf, epub, mobi, azw3, azw, djvu, fb2, cbz, cbr, doc, docx, zip, rar, 7z`.
 
 ```bash
 python download.py --ext pdf,epub     # keep only these types
