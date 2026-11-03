@@ -42,7 +42,8 @@ ALLOWED_EXTS = {"pdf", "epub", "mobi", "azw3", "azw", "djvu", "fb2",
 
 # Archive types we can unpack after downloading (when extraction is on).
 ARCHIVE_EXTS = {"zip", "rar", "7z"}
-EXTRACT = True  # set from --no-extract in main
+EXTRACT = True           # set from --no-extract in main
+DELETE_ARCHIVES = False  # set from --delete-archives in main
 
 # Remembers which channels you chose, so you don't re-pick them every run.
 SELECTION_FILE = Path(__file__).resolve().parent / "selected_channels.json"
@@ -425,6 +426,12 @@ async def download_one(client, message, folder, done=None, ledger_path=None):
         if EXTRACT and message_ext(message) in ARCHIVE_EXTS:
             if extract_archive(dest):
                 print(f"  extracted {dest.name}")
+                if DELETE_ARCHIVES:
+                    try:
+                        dest.unlink()
+                        print(f"  removed archive {dest.name}")
+                    except Exception as e:  # noqa: BLE001
+                        print(f"  could not remove {dest.name}: {e}")
         return "downloaded"
 
     try:
@@ -550,7 +557,7 @@ async def listen_mode(client, entities, out_root):
 
 
 async def main():
-    global ALLOWED_EXTS, EXTRACT
+    global ALLOWED_EXTS, EXTRACT, DELETE_ARCHIVES
     parser = argparse.ArgumentParser(
         description="Download media files from Telegram channels you joined.")
     parser.add_argument("-o", "--out", default="downloads",
@@ -572,6 +579,9 @@ async def main():
                              "(photos, videos, everything)")
     parser.add_argument("--no-extract", action="store_true",
                         help="don't auto-unpack downloaded zip/rar/7z archives")
+    parser.add_argument("--delete-archives", action="store_true",
+                        help="delete the zip/rar/7z after it extracts "
+                             "successfully (saves disk space)")
     parser.add_argument("--reset-channels", action="store_true",
                         help="forget saved channels and choose fresh")
     parser.add_argument("--session", default="tg_downloader",
@@ -579,6 +589,7 @@ async def main():
     args = parser.parse_args()
 
     EXTRACT = not args.no_extract
+    DELETE_ARCHIVES = args.delete_archives
 
     # Decide which file types to keep.
     if args.all_types:

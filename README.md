@@ -97,7 +97,8 @@ archive is kept.
   to open manually.
 
 ```bash
-python download.py --no-extract       # keep archives packed
+python download.py --no-extract         # keep archives packed
+python download.py --delete-archives    # delete each archive after it unpacks
 ```
 
 ## Listener mode (auto-download new files)
