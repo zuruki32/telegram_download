@@ -93,6 +93,18 @@ You only do this once. Normal runs don't re-verify everything — new files
 are checked as they download (they're written to a temporary name and only
 marked complete once fully saved), so the completed list stays trustworthy.
 
+### Just fix the log (no downloading)
+
+If you only want to tidy the `_completed.txt` logs — not re-download missing
+files — use `--relog`. It's instant and offline (no Telegram login): it
+rebuilds every log from the files on disk, moves any file left loose in a
+channel folder into its own folder (named from the filename), removes
+duplicate and `.part` entries, and sorts it.
+
+```bash
+python download.py --relog
+```
+
 ## Remembered channels
 
 The first time you pick channels, your choice is saved to

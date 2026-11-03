@@ -339,6 +339,44 @@ def rewrite_ledger(ledger_path, done):
         pass
 
 
+def rebuild_logs(out_root):
+    """Rebuild every channel's _completed.txt from the files on disk.
+
+    Offline and instant: no Telegram, no downloads. Each file is matched by
+    its id/filename and recorded with its real folder path, deduped, with
+    .part files ignored. Fixes a messy log in one shot.
+    """
+    channels = ([c for c in sorted(out_root.iterdir()) if c.is_dir()]
+                if out_root.exists() else [])
+    if not channels:
+        print(f"No channel folders found in {out_root}")
+        return
+    for child in channels:
+        have = scan_existing(child)
+        done = {}
+        moved = 0
+        for mid, p in have.items():
+            # A file loose in the channel folder (old layout) -> move it into
+            # its own folder, named from the filename (no Telegram needed).
+            if p.parent == child:
+                orig = re.sub(r"^\d+_", "", p.name)   # strip the id prefix
+                sub = folder_for_file("", orig, mid)
+                target = child / sub / p.name
+                if target != p:
+                    try:
+                        target.parent.mkdir(parents=True, exist_ok=True)
+                        p.replace(target)
+                        p = target
+                        moved += 1
+                    except Exception:  # noqa: BLE001
+                        pass
+            done[mid] = str(p.relative_to(child))
+        rewrite_ledger(child / LEDGER_NAME, done)
+        extra = f", {moved} moved into folders" if moved else ""
+        print(f"  {child.name}: {len(done)} files{extra}")
+    print(f"Rebuilt logs for {len(channels)} channel(s). No downloads made.")
+
+
 _ID_PREFIX = re.compile(r"^(\d+)_")
 
 
@@ -504,7 +542,12 @@ async def download_one(client, message, folder, done=None, ledger_path=None,
                 rel = str(existing.relative_to(root))
             except ValueError:
                 rel = existing.name
-            if done is None or message.id not in done:
+            if verify:
+                # Refresh the log entry to the real folder path (rewritten
+                # cleanly at the end of the verify pass).
+                if done is not None:
+                    done[message.id] = rel
+            elif done is None or message.id not in done:
                 record_done(done, ledger_path, message.id, rel)
             return "skipped"
         print(f"  corrupt, re-downloading: {existing.name}")
@@ -696,6 +739,9 @@ async def main():
     parser.add_argument("--verify", action="store_true",
                         help="re-check each already-downloaded file is present "
                              "and not corrupt; re-download missing/broken ones")
+    parser.add_argument("--relog", action="store_true",
+                        help="just rebuild the _completed.txt logs from files "
+                             "on disk (offline, no downloads) and exit")
     parser.add_argument("--inspect", type=int, default=0, metavar="N",
                         help="don't download; just print caption + filename "
                              "+ chosen folder for the first N files "
@@ -703,6 +749,11 @@ async def main():
     parser.add_argument("--session", default="tg_downloader",
                         help="session name; keeps you logged in between runs")
     args = parser.parse_args()
+
+    # Offline log rebuild: no login, no downloads.
+    if args.relog:
+        rebuild_logs(Path(args.out).expanduser().resolve())
+        return
 
     EXTRACT = not args.no_extract
     DELETE_ARCHIVES = args.delete_archives
