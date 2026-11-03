@@ -354,7 +354,8 @@ def scan_existing(root):
     if not root.exists():
         return have
     for p in root.rglob("*"):
-        if not p.is_file() or p.name == LEDGER_NAME:
+        # Ignore the ledger and half-finished .part downloads.
+        if not p.is_file() or p.name == LEDGER_NAME or p.name.endswith(".part"):
             continue
         m = _ID_PREFIX.match(p.name)
         if m:
@@ -513,12 +514,6 @@ async def download_one(client, message, folder, done=None, ledger_path=None,
             pass
         have.pop(message.id, None)
 
-    # Normal fast path: the ledger recorded it and that file still exists.
-    if done is not None and message.id in done:
-        recorded = done[message.id]
-        if recorded and (root / recorded).exists():
-            return "skipped"
-
     folder.mkdir(parents=True, exist_ok=True)
     dest = target_filename(message, folder)
     try:
@@ -595,16 +590,15 @@ async def download_one(client, message, folder, done=None, ledger_path=None,
 async def download_channel(client, entity, out_root, limit, verify=False):
     root = channel_folder(entity, out_root)
     done, ledger_path = load_ledger(root)
-    # The one-time verify pass indexes every file on disk (by name, across
-    # all folders) and checks it's intact. Normal runs skip this and rely on
-    # the ledger, which the verify pass rebuilds to match reality.
-    have = scan_existing(root) if verify else None
+    # Index every file already on disk by its id/filename (a quick name scan,
+    # not a content read). This is how we decide what's already downloaded,
+    # so it works no matter which folder a file is in or what the log says.
+    # --verify additionally reads each file to check it isn't corrupt.
+    have = scan_existing(root)
     title = getattr(entity, "title", str(entity.id))
-    if verify:
-        print(f"\n=== {title} -> {root} "
-              f"(verifying {len(have)} files on disk) ===")
-    else:
-        print(f"\n=== {title} -> {root} ===")
+    note = f" (verifying {len(have)} on disk)" if verify else \
+           f" ({len(have)} already on disk)"
+    print(f"\n=== {title} -> {root}{note} ===")
 
     counts = {"downloaded": 0, "skipped": 0, "filtered": 0, "failed": 0}
     async for message in client.iter_messages(entity, limit=limit):

@@ -142,12 +142,12 @@ is saved automatically into that channel's folder. Press Ctrl+C to stop.
   `downloads/<channel>/Evil Love Appears 1 3/...`. If a file has no name, the
   caption is used, and failing that the message id — so nothing is ever left
   loose in the channel folder.
-- **Resumable with a ledger.** Each channel folder has a `_completed.txt`
-  listing every file already saved (message id + where it was saved). On
-  restart the app skips a file only if it's recorded **and still on disk** —
-  if you deleted it or it was from an older folder layout, it re-downloads.
-  So stopping (Ctrl+C) and re-running never starts over, and nothing silently
-  goes missing.
+- **Resumable, by filename.** Before downloading, the app scans the channel
+  folder and recognises what's already there by each file's id prefix
+  (`000000952_...`) — no matter which subfolder it's in or what the log says.
+  So nothing re-downloads needlessly, old folder layouts still count, and
+  half-finished `.part` files never count as done. `_completed.txt` is just a
+  human-readable record of what was saved.
 - **Safe partial downloads.** Files download to a temporary `.part` name and
   are renamed only when complete, so a dropped connection never leaves a
   half-file that looks finished. The app also retries through network
