@@ -115,12 +115,16 @@ any channel folder. This is on by default.
 ```bash
 python download.py --no-dedup          # turn duplicate skipping off
 python download.py --dedup-formats     # also skip a book you already have in
-                                       # another format (same title)
+                                       # another format (pdf vs epub)
 ```
 
-`--dedup-formats` is best-effort: it matches by normalised title, so it can
-occasionally skip a differently-named edition you wanted. Leave it off unless
-you specifically want to avoid pdf+epub of the same novel.
+`--dedup-formats` skips a novel you already have in a **different format**. It
+matches by base title with the trailing volume/part number removed, so a
+single `Novel.pdf` and its numbered epub parts (`Novel 1.epub`,
+`Novel 2.epub`, …) count as the same book: if you have the pdf, the epub parts
+are skipped, and if you have any epub part, the pdf is skipped. Extra parts in
+the **same** format are still downloaded. It relies on consistent naming, so
+leave it off if a channel names editions very differently.
 
 Linked groups: just pick the group in the channel list like any other chat.
 Its copies of the channel's files are skipped by the size check, so they

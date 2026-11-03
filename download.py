@@ -433,15 +433,20 @@ def file_ok(path):
 # ---------------------------------------------------------------------------
 # Duplicate detection
 # ---------------------------------------------------------------------------
-def norm_title(filename):
-    """Normalised title from a filename (id prefix + extension removed).
+def _ext_of(name):
+    return Path(str(name or "")).suffix.lower().lstrip(".")
 
-    Used to spot the same book in another format. Keeps volume numbers so
-    different volumes of a series stay distinct.
+
+def base_title(filename):
+    """Book title with id prefix, extension and trailing volume/part number
+    removed, normalised to lowercase letters/digits.
+
+    So one pdf and its matching numbered epub parts share a base title
+    (e.g. "Novel.pdf", "Novel 1.epub", "Novel 2.epub" -> "novel"), which lets
+    us spot the same novel across formats.
     """
-    name = re.sub(r"^\d+_", "", str(filename or ""))   # strip id prefix
-    name = Path(name).stem                              # strip extension
-    return re.sub(r"[^0-9a-z]+", "", name.lower())      # alnum, lowercase
+    stem = Path(re.sub(r"^\d+_", "", str(filename or ""))).stem
+    return re.sub(r"[^0-9a-z]", "", _clean_title(stem).lower())
 
 
 class Dedup:
@@ -449,34 +454,37 @@ class Dedup:
 
     by_size: skip a download whose byte size matches a file we already have
              (the reliable 'same file, maybe reposted or renamed' signal).
-    by_title: also skip if we already have a file with the same normalised
-              title (catches the same novel in another format, best-effort).
+    by_title: skip if we already have the same book (base title) in a
+              DIFFERENT format. Numbered parts in the same format are kept.
     """
 
     def __init__(self, by_size=True, by_title=False):
         self.by_size = by_size
         self.by_title = by_title
         self.sizes = set()
-        self.titles = set()
+        self.title_exts = {}   # base title -> set of extensions seen
 
-    def why_duplicate(self, size, title):
+    def why_duplicate(self, size, base, ext):
         if self.by_size and size and size in self.sizes:
             return "same size"
-        if self.by_title and title and title in self.titles:
-            return "same title/other format"
+        if self.by_title and base:
+            seen = self.title_exts.get(base)
+            if seen and any(e != ext for e in seen):
+                return f"same book, already have .{sorted(seen)[0]}"
         return None
 
-    def add(self, size, title):
+    def add(self, size, base, ext):
         if size:
             self.sizes.add(size)
-        if title:
-            self.titles.add(title)
+        if base:
+            self.title_exts.setdefault(base, set()).add(ext)
 
 
 def build_dedup(out_root, by_size, by_title):
-    """Index sizes and titles of every file already on disk, across all
-    channels (so a channel file also posted in its linked group, or the same
-    book renamed, isn't downloaded twice)."""
+    """Index size, base title and format of every file already on disk, across
+    all channels (so a channel file also posted in its linked group, the same
+    file renamed, or the same book in another format, isn't downloaded again).
+    """
     dd = Dedup(by_size, by_title)
     if out_root.exists():
         for p in out_root.rglob("*"):
@@ -484,7 +492,7 @@ def build_dedup(out_root, by_size, by_title):
                     or p.name.endswith(".part") or not _ID_PREFIX.match(p.name)):
                 continue
             try:
-                dd.add(p.stat().st_size, norm_title(p.name))
+                dd.add(p.stat().st_size, base_title(p.name), _ext_of(p.name))
             except Exception:  # noqa: BLE001
                 pass
     return dd
@@ -662,8 +670,8 @@ async def download_one(client, message, folder, done=None, ledger_path=None,
     # again. Bypassed when re-downloading a corrupt file.
     if dedup is not None and not force:
         size = message.file.size if message.file else 0
-        title = norm_title(message.file.name if message.file else "")
-        why = dedup.why_duplicate(size, title)
+        fname = message.file.name if message.file else ""
+        why = dedup.why_duplicate(size, base_title(fname), message_ext(message))
         if why:
             print(f"  duplicate ({why}), skipping: {dest.name}")
             return "duplicate"
@@ -695,7 +703,7 @@ async def download_one(client, message, folder, done=None, ledger_path=None,
         record_done(done, ledger_path, message.id, saved_rel)
         if dedup is not None and message.file:
             dedup.add(message.file.size,
-                      norm_title(message.file.name))
+                      base_title(message.file.name), message_ext(message))
         return "downloaded"
 
     last_err = None
