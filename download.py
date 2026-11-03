@@ -690,41 +690,18 @@ def wanted(message):
     return message_ext(message) in ALLOWED_EXTS
 
 
-async def _fetch_media(client, message, part, progress, fast):
-    """Download one message's media to `part`, in parallel if possible."""
-    doc = getattr(message, "document", None)
-    size = message.file.size if message.file else 0
-    if fast is not None and doc is not None and size:
-        try:
-            with open(part, "wb") as fh:
-                await fast.download(doc, size, fh, progress=progress)
-            return
-        except Exception as e:  # noqa: BLE001 - fall back to single stream
-            print(f"  parallel download failed ({e}); using single stream")
-    await client.download_media(message, file=str(part),
-                                progress_callback=progress)
-
-
-async def _fetch_guarded(client, message, part, progress, fast, stall=60):
-    """Run _fetch_media with a stall watchdog: if no data arrives for `stall`
-    seconds (a dead connection that never errors), abort so the caller can
-    retry or move on instead of hanging forever."""
-    loop = asyncio.get_event_loop()
-    state = {"t": loop.time()}
-
-    def watched(received, total):
-        state["t"] = loop.time()
-        progress(received, total)
-
-    task = asyncio.ensure_future(
-        _fetch_media(client, message, part, watched, fast))
+async def _run_with_stall(coro_factory, state, stall, loop):
+    """Run a coroutine with a stall watchdog on the shared progress clock
+    `state['t']`: if no data arrives for `stall` seconds, cancel it and raise
+    TimeoutError. Lets the parallel path bail quickly so native can take over."""
+    task = asyncio.ensure_future(coro_factory())
     try:
         while True:
-            await asyncio.wait({task}, timeout=15)
+            await asyncio.wait({task}, timeout=8)
             if task.done():
-                return task.result()   # re-raises any download error
+                return task.result()
             if loop.time() - state["t"] > stall:
-                raise TimeoutError(f"stalled: no data for {stall}s")
+                raise TimeoutError(f"no data for {stall}s")
     finally:
         if not task.done():
             task.cancel()
@@ -732,6 +709,49 @@ async def _fetch_guarded(client, message, part, progress, fast, stall=60):
                 await task
             except BaseException:  # noqa: BLE001
                 pass
+
+
+async def _fetch_guarded(client, message, part, progress, fast):
+    """Download one message's media to `part`.
+
+    Tries the parallel (fast) path first, but bails quickly to the NATIVE
+    downloader on any stall or error. The native downloader handles the
+    files the parallel senders can't: CDN-redirected media, expired file
+    references, and small-file edge cases. Only if native also stalls does
+    this raise TimeoutError (caller marks it 'unreachable' for next run).
+    """
+    doc = getattr(message, "document", None)
+    size = message.file.size if message.file else 0
+    loop = asyncio.get_event_loop()
+    state = {"t": loop.time()}
+
+    def watched(received, total):
+        state["t"] = loop.time()
+        progress(received, total)
+
+    # 1) Parallel path, bailed fast (25s of no data) to native.
+    if fast is not None and doc is not None and size:
+        async def parallel():
+            with open(part, "wb") as fh:
+                await fast.download(doc, size, fh, progress=watched)
+        try:
+            state["t"] = loop.time()
+            await _run_with_stall(parallel, state, 25, loop)
+            return
+        except Exception as e:  # noqa: BLE001
+            # Log the REAL reason (CDN redirect / FILE_REFERENCE_EXPIRED /
+            # FloodWait / stall) so we know which case it is.
+            print(f"  parallel failed ({type(e).__name__}: {e}); "
+                  f"using native downloader")
+
+    # 2) Native downloader (handles CDN redirects, reference refresh, etc.),
+    #    with its own stall watchdog for a genuinely dead file.
+    state["t"] = loop.time()
+
+    async def native():
+        await client.download_media(message, file=str(part),
+                                    progress_callback=watched)
+    await _run_with_stall(native, state, 60, loop)
 
 
 async def download_one(client, message, folder, done=None, ledger_path=None,

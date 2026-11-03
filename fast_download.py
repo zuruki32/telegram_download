@@ -128,7 +128,14 @@ class FastDownloader:
                          for i in range(n) if done + i < part_count]
                 for i, fut in batch:
                     result = await fut
-                    data = result.bytes
+                    # CDN-redirected files return upload.fileCdnRedirect, not
+                    # file bytes; the parallel path can't follow it, so bail to
+                    # the native downloader with a clear reason.
+                    data = getattr(result, "bytes", None)
+                    if data is None:
+                        raise TypeError(
+                            f"CDN redirect / unsupported file "
+                            f"({type(result).__name__})")
                     if data:
                         out.write(data)
                         downloaded += len(data)
