@@ -105,6 +105,27 @@ duplicate and `.part` entries, and sorts it.
 python download.py --relog
 ```
 
+## Duplicate detection
+
+To avoid downloading the same book twice — for example a channel's file that
+also appears in its **linked discussion group**, or the same file renamed —
+the app skips any file whose **byte size** matches one you already have, in
+any channel folder. This is on by default.
+
+```bash
+python download.py --no-dedup          # turn duplicate skipping off
+python download.py --dedup-formats     # also skip a book you already have in
+                                       # another format (same title)
+```
+
+`--dedup-formats` is best-effort: it matches by normalised title, so it can
+occasionally skip a differently-named edition you wanted. Leave it off unless
+you specifically want to avoid pdf+epub of the same novel.
+
+Linked groups: just pick the group in the channel list like any other chat.
+Its copies of the channel's files are skipped by the size check, so they
+aren't downloaded again.
+
 ## Remembered channels
 
 The first time you pick channels, your choice is saved to

@@ -430,6 +430,66 @@ def file_ok(path):
         return False
 
 
+# ---------------------------------------------------------------------------
+# Duplicate detection
+# ---------------------------------------------------------------------------
+def norm_title(filename):
+    """Normalised title from a filename (id prefix + extension removed).
+
+    Used to spot the same book in another format. Keeps volume numbers so
+    different volumes of a series stay distinct.
+    """
+    name = re.sub(r"^\d+_", "", str(filename or ""))   # strip id prefix
+    name = Path(name).stem                              # strip extension
+    return re.sub(r"[^0-9a-z]+", "", name.lower())      # alnum, lowercase
+
+
+class Dedup:
+    """Remembers files already present so duplicates aren't downloaded again.
+
+    by_size: skip a download whose byte size matches a file we already have
+             (the reliable 'same file, maybe reposted or renamed' signal).
+    by_title: also skip if we already have a file with the same normalised
+              title (catches the same novel in another format, best-effort).
+    """
+
+    def __init__(self, by_size=True, by_title=False):
+        self.by_size = by_size
+        self.by_title = by_title
+        self.sizes = set()
+        self.titles = set()
+
+    def why_duplicate(self, size, title):
+        if self.by_size and size and size in self.sizes:
+            return "same size"
+        if self.by_title and title and title in self.titles:
+            return "same title/other format"
+        return None
+
+    def add(self, size, title):
+        if size:
+            self.sizes.add(size)
+        if title:
+            self.titles.add(title)
+
+
+def build_dedup(out_root, by_size, by_title):
+    """Index sizes and titles of every file already on disk, across all
+    channels (so a channel file also posted in its linked group, or the same
+    book renamed, isn't downloaded twice)."""
+    dd = Dedup(by_size, by_title)
+    if out_root.exists():
+        for p in out_root.rglob("*"):
+            if (not p.is_file() or p.name == LEDGER_NAME
+                    or p.name.endswith(".part") or not _ID_PREFIX.match(p.name)):
+                continue
+            try:
+                dd.add(p.stat().st_size, norm_title(p.name))
+            except Exception:  # noqa: BLE001
+                pass
+    return dd
+
+
 # Trailing "volume / part / number" markers to strip off a title, e.g.
 # "Evil Love Appears 1-3", "Title (Vol 2)", "Name part 4".
 _VOL_TAIL = re.compile(
@@ -470,21 +530,47 @@ def _clean_title(text):
     return name if sum(ch.isalpha() for ch in name) >= 2 else ""
 
 
+# Generic/meaningless filenames Telegram gives when the uploader didn't name
+# the file, e.g. "downloadfile-85.bin", "document", "file_123". For these the
+# caption (the post text) is a better source for the folder name.
+_GENERIC_NAME = re.compile(
+    r"^(download(file)?|file|document|doc|unknown|untitled|image|photo|"
+    r"video|audio|voice|attachment|ebook|book)[\s_\-]*\d*$", re.IGNORECASE)
+
+
+def _is_generic_name(stem):
+    s = stem.strip().lower()
+    if not s or _GENERIC_NAME.match(s):
+        return True
+    if re.fullmatch(r"[\d\s_\-.]+", s):            # only digits/separators
+        return True
+    return sum(ch.isalpha() for ch in s) < 3        # too few letters
+
+
+def _prettify(stem):
+    s = re.sub(r"[_\.]+", " ", stem)                # underscores/dots -> spaces
+    s = re.sub(r"\s+", " ", s).strip()
+    return safe_name(s, "")
+
+
 def folder_for_file(caption, filename, msg_id):
     """Folder name for one file: named after the file itself.
 
     Each book goes in its own folder. We use the file's own name first
-    (that's the book title in most channels), fall back to the caption,
-    and finally to the message id. Never empty, so files are never dumped
-    loose in the channel folder.
+    (that's the book title in most channels), but when the filename is
+    generic (e.g. "downloadfile-85.bin") we use the caption instead, and
+    finally fall back to the message id. Never empty.
     """
     stem = Path(filename or "").stem.strip()
-    pretty = re.sub(r"[_\.]+", " ", stem)          # underscores/dots -> spaces
-    pretty = re.sub(r"\s+", " ", pretty).strip()
-    name = safe_name(pretty, "")
-    if sum(ch.isalpha() for ch in name) < 1:       # no real name on the file
-        name = _clean_title(caption)
-    return name or f"book_{msg_id}"
+    if not _is_generic_name(stem):
+        pretty = _prettify(stem)
+        if pretty:
+            return pretty
+    # Generic or empty filename -> the caption is the better title.
+    from_caption = _clean_title(caption)
+    if from_caption:
+        return from_caption
+    return _prettify(stem) or f"book_{msg_id}"
 
 
 def message_ext(message):
@@ -505,14 +591,15 @@ def wanted(message):
 
 
 async def download_one(client, message, folder, done=None, ledger_path=None,
-                       have=None, verify=False):
+                       have=None, verify=False, dedup=None):
     """Download a single message's media into folder.
 
-    Returns 'downloaded', 'skipped', 'filtered', or 'failed'. Shared by the
-    bulk backfill and the live listener so both behave identically. `done` /
-    `ledger_path` are the channel resume ledger; `have` maps message ids to
-    files already on disk; `verify` re-checks those files aren't corrupt.
+    Returns 'downloaded', 'skipped', 'filtered', 'duplicate', or 'failed'.
+    `done`/`ledger_path` are the channel resume ledger; `have` maps message
+    ids to files already on disk; `verify` re-checks those aren't corrupt;
+    `dedup` skips files whose content (size) we already have elsewhere.
     """
+    force = False  # set when re-downloading a corrupt file (bypasses dedup)
     if not message.media:
         return "skipped"
 
@@ -556,6 +643,7 @@ async def download_one(client, message, folder, done=None, ledger_path=None,
         except Exception:  # noqa: BLE001
             pass
         have.pop(message.id, None)
+        force = True   # we want this one back even if a same-size copy exists
 
     folder.mkdir(parents=True, exist_ok=True)
     dest = target_filename(message, folder)
@@ -567,6 +655,18 @@ async def download_one(client, message, folder, done=None, ledger_path=None,
     if dest.exists() and dest.stat().st_size > 0 and (not verify or file_ok(dest)):
         record_done(done, ledger_path, message.id, rel)
         return "skipped"
+
+    # Duplicate check: same content (size) — or same title, if enabled —
+    # already downloaded elsewhere (e.g. this channel's file reposted in its
+    # linked group, or the same book under a different name). Don't fetch it
+    # again. Bypassed when re-downloading a corrupt file.
+    if dedup is not None and not force:
+        size = message.file.size if message.file else 0
+        title = norm_title(message.file.name if message.file else "")
+        why = dedup.why_duplicate(size, title)
+        if why:
+            print(f"  duplicate ({why}), skipping: {dest.name}")
+            return "duplicate"
 
     # Download to a temporary .part file and only rename it into place when
     # fully done. A half-downloaded file (e.g. network drop) is therefore
@@ -593,6 +693,9 @@ async def download_one(client, message, folder, done=None, ledger_path=None,
                     except Exception as e:  # noqa: BLE001
                         print(f"  could not remove {dest.name}: {e}")
         record_done(done, ledger_path, message.id, saved_rel)
+        if dedup is not None and message.file:
+            dedup.add(message.file.size,
+                      norm_title(message.file.name))
         return "downloaded"
 
     last_err = None
@@ -630,7 +733,8 @@ async def download_one(client, message, folder, done=None, ledger_path=None,
     return "failed"
 
 
-async def download_channel(client, entity, out_root, limit, verify=False):
+async def download_channel(client, entity, out_root, limit, verify=False,
+                           dedup=None):
     root = channel_folder(entity, out_root)
     done, ledger_path = load_ledger(root)
     # Index every file already on disk by its id/filename (a quick name scan,
@@ -643,7 +747,8 @@ async def download_channel(client, entity, out_root, limit, verify=False):
            f" ({len(have)} already on disk)"
     print(f"\n=== {title} -> {root}{note} ===")
 
-    counts = {"downloaded": 0, "skipped": 0, "filtered": 0, "failed": 0}
+    counts = {"downloaded": 0, "skipped": 0, "filtered": 0,
+              "duplicate": 0, "failed": 0}
     async for message in client.iter_messages(entity, limit=limit):
         if not message.media:
             continue
@@ -651,18 +756,18 @@ async def download_channel(client, entity, out_root, limit, verify=False):
         sub = folder_for_file(message.message, fname, message.id)
         dest_folder = root / sub
         counts[await download_one(client, message, dest_folder,
-                                  done, ledger_path, have, verify)] += 1
+                                  done, ledger_path, have, verify, dedup)] += 1
 
     if verify:
         rewrite_ledger(ledger_path, done)  # clean list matching real files
 
     print(f"  done: {counts['downloaded']} downloaded, "
-          f"{counts['skipped']} already had, "
+          f"{counts['skipped']} already had, {counts['duplicate']} duplicates, "
           f"{counts['filtered']} wrong type, {counts['failed']} failed")
     return counts["downloaded"], counts["skipped"], counts["failed"]
 
 
-async def listen_mode(client, entities, out_root):
+async def listen_mode(client, entities, out_root, dedup=None):
     """Stay connected and download new media as it's posted."""
     folders = {e.id: channel_folder(e, out_root) for e in entities}
     names = ", ".join(getattr(e, "title", str(e.id)) for e in entities)
@@ -685,8 +790,8 @@ async def listen_mode(client, entities, out_root):
             fname = m.file.name if m.file else None
             sub = folder_for_file(m.message or event.text, fname, m.id)
             dest_folder = root / sub
-            if await download_one(client, m, dest_folder,
-                                  done, path, have) == "downloaded":
+            if await download_one(client, m, dest_folder, done, path,
+                                  have, False, dedup) == "downloaded":
                 print(f"[{title}] saved -> {dest_folder}")
 
     @client.on(events.NewMessage(chats=entities))
@@ -699,8 +804,8 @@ async def listen_mode(client, entities, out_root):
         sub = folder_for_file(event.message.message, fname, event.message.id)
         dest_folder = root / sub
         title = getattr(event.chat, "title", str(event.chat_id))
-        if await download_one(client, event.message, dest_folder,
-                              done, path, have) == "downloaded":
+        if await download_one(client, event.message, dest_folder, done, path,
+                              have, False, dedup) == "downloaded":
             print(f"[{title}] saved -> {dest_folder}")
 
     print(f"\nListening for new files on: {names}")
@@ -742,6 +847,13 @@ async def main():
     parser.add_argument("--relog", action="store_true",
                         help="just rebuild the _completed.txt logs from files "
                              "on disk (offline, no downloads) and exit")
+    parser.add_argument("--no-dedup", action="store_true",
+                        help="don't skip files whose size matches one you "
+                             "already have (turns off duplicate detection)")
+    parser.add_argument("--dedup-formats", action="store_true",
+                        help="also skip a book you already have in another "
+                             "format (same title); best-effort, may skip "
+                             "differently-named editions")
     parser.add_argument("--inspect", type=int, default=0, metavar="N",
                         help="don't download; just print caption + filename "
                              "+ chosen folder for the first N files "
@@ -790,6 +902,23 @@ async def main():
 
     targets = await pick_targets(client, args.all, reset=args.reset_channels)
 
+    # Build the duplicate index from everything already on disk (all folders),
+    # so a file reposted in a linked group, or the same book renamed, isn't
+    # downloaded twice. Shared across channels and the listener, updated live.
+    dedup = None
+    if not args.no_dedup or args.dedup_formats:
+        dedup = build_dedup(out_root, by_size=not args.no_dedup,
+                            by_title=args.dedup_formats)
+        bits = []
+        if not args.no_dedup:
+            bits.append("same size")
+        if args.dedup_formats:
+            bits.append("same title")
+        print(f"Duplicate check: on ({', '.join(bits)}); "
+              f"{len(dedup.sizes)} files indexed.")
+    else:
+        print("Duplicate check: off.")
+
     # Diagnostic: show what captions/filenames look like and where each
     # file would go, without downloading anything.
     if args.inspect:
@@ -820,7 +949,8 @@ async def main():
         for entity in targets:
             try:
                 d, s, f = await download_channel(client, entity, out_root,
-                                                 args.limit, verify=args.verify)
+                                                 args.limit, verify=args.verify,
+                                                 dedup=dedup)
                 totals[0] += d
                 totals[1] += s
                 totals[2] += f
@@ -831,7 +961,7 @@ async def main():
 
     if args.listen:
         # Keep running; download new files as they arrive.
-        await listen_mode(client, targets, out_root)
+        await listen_mode(client, targets, out_root, dedup=dedup)
     else:
         await client.disconnect()
         print(f"All finished. Files are in: {out_root}")
