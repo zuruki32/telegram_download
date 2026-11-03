@@ -590,6 +590,10 @@ async def main():
                              "successfully (saves disk space)")
     parser.add_argument("--reset-channels", action="store_true",
                         help="forget saved channels and choose fresh")
+    parser.add_argument("--inspect", type=int, default=0, metavar="N",
+                        help="don't download; just print caption + filename "
+                             "+ chosen folder for the first N files "
+                             "(for debugging folder names)")
     parser.add_argument("--session", default="tg_downloader",
                         help="session name; keeps you logged in between runs")
     args = parser.parse_args()
@@ -622,6 +626,30 @@ async def main():
           f"(@{me.username})" if me.username else f"Logged in as {me.first_name}")
 
     targets = await pick_targets(client, args.all, reset=args.reset_channels)
+
+    # Diagnostic: show what captions/filenames look like and where each
+    # file would go, without downloading anything.
+    if args.inspect:
+        for entity in targets:
+            title = getattr(entity, "title", str(entity.id))
+            print(f"\n--- {title}: first {args.inspect} files ---")
+            shown = 0
+            async for m in client.iter_messages(entity, limit=500):
+                if not m.media:
+                    continue
+                fn = m.file.name if m.file else None
+                cap = (m.message or "").replace("\n", " | ")[:90]
+                gid = getattr(m, "grouped_id", None)
+                print(f"[{m.id}] gid={gid} ext={message_ext(m)!r} "
+                      f"name={fn!r}\n      caption={cap!r}\n"
+                      f"      -> folder={novel_folder(m.message, fn)!r}")
+                shown += 1
+                if shown >= args.inspect:
+                    break
+            if shown == 0:
+                print("  (no media files found in the newest 500 messages)")
+        await client.disconnect()
+        return
 
     # Backfill existing files first (unless --listen with --limit 0).
     if not (args.listen and args.limit == 0):
