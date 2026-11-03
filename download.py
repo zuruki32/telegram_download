@@ -849,15 +849,38 @@ async def download_channel(client, entity, out_root, limit, verify=False,
 
     counts = {"downloaded": 0, "skipped": 0, "filtered": 0,
               "duplicate": 0, "toobig": 0, "failed": 0}
-    async for message in client.iter_messages(entity, limit=limit):
-        if not message.media:
-            continue
-        fname = message.file.name if message.file else None
-        sub = folder_for_file(message.message, fname, message.id)
-        dest_folder = root / sub
-        counts[await download_one(client, message, dest_folder, done,
-                                  ledger_path, have, verify, dedup,
-                                  force_ids, fast)] += 1
+    # Resilient listing: if the connection drops mid-scan (flaky proxy link),
+    # resume from the last message seen instead of abandoning the channel.
+    last_id = 0           # resume point (messages come newest-first)
+    remaining = limit     # None = all
+    hiccups = 0
+    while True:
+        try:
+            async for message in client.iter_messages(entity, offset_id=last_id,
+                                                       limit=remaining):
+                last_id = message.id
+                if not message.media:
+                    continue
+                fname = message.file.name if message.file else None
+                sub = folder_for_file(message.message, fname, message.id)
+                dest_folder = root / sub
+                counts[await download_one(client, message, dest_folder, done,
+                                          ledger_path, have, verify, dedup,
+                                          force_ids, fast)] += 1
+                if remaining is not None:
+                    remaining -= 1
+            break   # finished the whole channel
+        except FloodWaitError as e:
+            print(f"  rate-limited while listing, waiting {e.seconds}s ...")
+            await asyncio.sleep(e.seconds + 1)
+        except Exception as e:  # noqa: BLE001 - connection drops, timeouts
+            hiccups += 1
+            if hiccups > 30:
+                print(f"  stopping channel after repeated listing errors: {e}")
+                break
+            print(f"  connection hiccup while listing ({e}); "
+                  f"resuming from message {last_id} in 5s ...")
+            await asyncio.sleep(5)
 
     if verify:
         rewrite_ledger(ledger_path, done)  # clean list matching real files
