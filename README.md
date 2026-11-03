@@ -116,11 +116,11 @@ is saved automatically into that channel's folder. Press Ctrl+C to stop.
 
 ## Good to know
 
-- **A folder per novel.** Inside each channel's folder, files are grouped by
-  their caption (the novel/book title) into subfolders — albums posted
-  together, or single files with a title, each get their own folder:
-  `downloads/<channel>/<novel title>/...`. Files with no caption stay in the
-  channel folder.
+- **A folder per file.** Inside each channel's folder, every file goes in its
+  own subfolder named after the file (the book title), e.g.
+  `downloads/<channel>/Evil Love Appears 1 3/...`. If a file has no name, the
+  caption is used, and failing that the message id — so nothing is ever left
+  loose in the channel folder.
 - **Resumable with a ledger.** Each channel folder has a `_completed.txt`
   listing every file already saved (message id + name). On restart the app
   reads it and skips what's done, so stopping (Ctrl+C) and re-running never

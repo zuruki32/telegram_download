@@ -366,9 +366,21 @@ def _clean_title(text):
     return name if sum(ch.isalpha() for ch in name) >= 2 else ""
 
 
-def novel_folder(caption, filename=""):
-    """Subfolder name for a book: prefer the caption, else the filename."""
-    return _clean_title(caption) or _clean_title(Path(filename or "").stem)
+def folder_for_file(caption, filename, msg_id):
+    """Folder name for one file: named after the file itself.
+
+    Each book goes in its own folder. We use the file's own name first
+    (that's the book title in most channels), fall back to the caption,
+    and finally to the message id. Never empty, so files are never dumped
+    loose in the channel folder.
+    """
+    stem = Path(filename or "").stem.strip()
+    pretty = re.sub(r"[_\.]+", " ", stem)          # underscores/dots -> spaces
+    pretty = re.sub(r"\s+", " ", pretty).strip()
+    name = safe_name(pretty, "")
+    if sum(ch.isalpha() for ch in name) < 1:       # no real name on the file
+        name = _clean_title(caption)
+    return name or f"book_{msg_id}"
 
 
 def message_ext(message):
@@ -475,40 +487,14 @@ async def download_channel(client, entity, out_root, limit):
     print(f"\n=== {title} -> {root} ===")
 
     counts = {"downloaded": 0, "skipped": 0, "filtered": 0, "failed": 0}
-    album = []          # messages of the album currently being collected
-    album_gid = None    # grouped_id of that album
-
-    async def flush():
-        # Download the buffered album into one subfolder named after its
-        # caption (the novel title). Standalone posts flush as a group of 1.
-        if not album:
-            return
-        caption = ""
-        fname = ""
-        for m in album:
-            text = (m.message or "").strip()
-            if text and not caption:
-                caption = text
-            if m.file and m.file.name and not fname:
-                fname = m.file.name
-        sub = novel_folder(caption, fname)
-        dest_folder = root / sub if sub else root
-        for m in album:
-            counts[await download_one(client, m, dest_folder,
-                                      done, ledger_path)] += 1
-        album.clear()
-
     async for message in client.iter_messages(entity, limit=limit):
         if not message.media:
             continue
-        gid = getattr(message, "grouped_id", None)
-        if gid is not None and gid == album_gid:
-            album.append(message)       # same album, keep collecting
-            continue
-        await flush()                   # new album/post -> save the last one
-        album_gid = gid
-        album.append(message)
-    await flush()
+        fname = message.file.name if message.file else None
+        sub = folder_for_file(message.message, fname, message.id)
+        dest_folder = root / sub
+        counts[await download_one(client, message, dest_folder,
+                                  done, ledger_path)] += 1
 
     print(f"  done: {counts['downloaded']} downloaded, "
           f"{counts['skipped']} already had, "
@@ -531,16 +517,16 @@ async def listen_mode(client, entities, out_root):
 
     @client.on(events.Album(chats=entities))
     async def on_album(event):
-        # A whole novel posted as one album -> its own subfolder.
         root, done, path = ledger_for(event.chat_id, event.chat)
-        fname = next((m.file.name for m in event.messages
-                      if m.file and m.file.name), "")
-        sub = novel_folder(event.text, fname)
-        dest_folder = root / sub if sub else root
         title = getattr(event.chat, "title", str(event.chat_id))
         for m in event.messages:
-            if m.media and await download_one(client, m, dest_folder,
-                                              done, path) == "downloaded":
+            if not m.media:
+                continue
+            fname = m.file.name if m.file else None
+            sub = folder_for_file(m.message or event.text, fname, m.id)
+            dest_folder = root / sub
+            if await download_one(client, m, dest_folder,
+                                  done, path) == "downloaded":
                 print(f"[{title}] saved -> {dest_folder}")
 
     @client.on(events.NewMessage(chats=entities))
@@ -549,9 +535,9 @@ async def listen_mode(client, entities, out_root):
         if event.message.grouped_id or not event.message.media:
             return
         root, done, path = ledger_for(event.chat_id, event.chat)
-        fname = event.message.file.name if event.message.file else ""
-        sub = novel_folder(event.message.message, fname)
-        dest_folder = root / sub if sub else root
+        fname = event.message.file.name if event.message.file else None
+        sub = folder_for_file(event.message.message, fname, event.message.id)
+        dest_folder = root / sub
         title = getattr(event.chat, "title", str(event.chat_id))
         if await download_one(client, event.message, dest_folder,
                               done, path) == "downloaded":
@@ -642,7 +628,7 @@ async def main():
                 gid = getattr(m, "grouped_id", None)
                 print(f"[{m.id}] gid={gid} ext={message_ext(m)!r} "
                       f"name={fn!r}\n      caption={cap!r}\n"
-                      f"      -> folder={novel_folder(m.message, fn)!r}")
+                      f"      -> folder={folder_for_file(m.message, fn, m.id)!r}")
                 shown += 1
                 if shown >= args.inspect:
                     break
