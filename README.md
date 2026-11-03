@@ -122,9 +122,15 @@ is saved automatically into that channel's folder. Press Ctrl+C to stop.
   caption is used, and failing that the message id — so nothing is ever left
   loose in the channel folder.
 - **Resumable with a ledger.** Each channel folder has a `_completed.txt`
-  listing every file already saved (message id + name). On restart the app
-  reads it and skips what's done, so stopping (Ctrl+C) and re-running never
-  starts over. It also double-checks the files on disk as a backup.
+  listing every file already saved (message id + where it was saved). On
+  restart the app skips a file only if it's recorded **and still on disk** —
+  if you deleted it or it was from an older folder layout, it re-downloads.
+  So stopping (Ctrl+C) and re-running never starts over, and nothing silently
+  goes missing.
+- **Safe partial downloads.** Files download to a temporary `.part` name and
+  are renamed only when complete, so a dropped connection never leaves a
+  half-file that looks finished. The app also retries through network
+  hiccups.
 - **Organized naming.** Files are prefixed with their message id so order is
   preserved and names never collide.
 - **Rate limits.** Telegram throttles bulk downloads; the tool waits

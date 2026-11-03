@@ -300,28 +300,29 @@ LEDGER_NAME = "_completed.txt"
 
 
 def load_ledger(channel_root):
-    """Return (set_of_done_message_ids, path_to_ledger)."""
+    """Return ({message_id: saved_path_relative_to_channel}, ledger_path)."""
     path = channel_root / LEDGER_NAME
-    done = set()
+    done = {}
     if path.exists():
         try:
             for line in path.read_text(encoding="utf-8").splitlines():
-                token = line.strip().split("\t", 1)[0].strip()
+                parts = line.rstrip("\n").split("\t", 1)
+                token = parts[0].strip()
                 if token.isdigit():
-                    done.add(int(token))
+                    done[int(token)] = parts[1] if len(parts) > 1 else ""
         except Exception:  # noqa: BLE001 - a bad ledger shouldn't stop us
             pass
     return done, path
 
 
-def record_done(done, ledger_path, message_id, name):
+def record_done(done, ledger_path, message_id, relpath):
     """Mark a message as finished, in memory and in the ledger file."""
     if done is not None:
-        done.add(message_id)
+        done[message_id] = relpath
     if ledger_path is not None:
         try:
             with open(ledger_path, "a", encoding="utf-8") as f:
-                f.write(f"{message_id}\t{name}\n")
+                f.write(f"{message_id}\t{relpath}\n")
         except Exception:  # noqa: BLE001
             pass
 
@@ -414,33 +415,34 @@ async def download_one(client, message, folder, done=None, ledger_path=None):
     if not wanted(message):
         return "filtered"
 
-    # Fast skip: the ledger already says this one is done.
+    root = ledger_path.parent if ledger_path is not None else folder
+
+    # Skip only if the ledger says done AND that file is still on disk.
+    # If it was deleted or lived in an old folder layout, re-download it.
     if done is not None and message.id in done:
-        return "skipped"
+        rel = done[message.id]
+        if rel and (root / rel).exists():
+            return "skipped"
 
     folder.mkdir(parents=True, exist_ok=True)
     dest = target_filename(message, folder)
+    try:
+        rel = str(dest.relative_to(root))
+    except ValueError:
+        rel = dest.name
     # Backup skip: the file is already on disk (ledger lost or first run).
     if dest.exists() and dest.stat().st_size > 0:
-        record_done(done, ledger_path, message.id, dest.name)
+        record_done(done, ledger_path, message.id, rel)
         return "skipped"
 
-    bar = None
-    if tqdm is not None and message.file and message.file.size:
-        bar = tqdm(
-            total=message.file.size,
-            unit="B",
-            unit_scale=True,
-            desc=dest.name[:40],
-            leave=False,
-        )
-
-    def progress(received, total, _bar=bar):
-        if _bar is not None:
-            _bar.update(received - _bar.n)
+    # Download to a temporary .part file and only rename it into place when
+    # fully done. A half-downloaded file (e.g. network drop) is therefore
+    # never mistaken for a complete one, and resumes cleanly next run.
+    part = dest.with_name(dest.name + ".part")
 
     def finish():
-        record_done(done, ledger_path, message.id, dest.name)
+        part.replace(dest)
+        record_done(done, ledger_path, message.id, rel)
         if EXTRACT and message_ext(message) in ARCHIVE_EXTS:
             if extract_archive(dest):
                 print(f"  extracted {dest.name}")
@@ -452,32 +454,39 @@ async def download_one(client, message, folder, done=None, ledger_path=None):
                         print(f"  could not remove {dest.name}: {e}")
         return "downloaded"
 
-    try:
-        await client.download_media(message, file=str(dest),
-                                    progress_callback=progress)
-        return finish()
-    except FloodWaitError as e:
-        # Telegram asked us to slow down; honor it and retry once.
-        if bar:
-            bar.close()
-            bar = None
-        print(f"  rate-limited, waiting {e.seconds}s ...")
-        await asyncio.sleep(e.seconds + 1)
+    last_err = None
+    for attempt in range(1, 4):  # up to 3 tries through network hiccups
+        bar = None
+        if tqdm is not None and message.file and message.file.size:
+            bar = tqdm(total=message.file.size, unit="B", unit_scale=True,
+                       desc=dest.name[:40], leave=False)
+
+        def progress(received, total, _bar=bar):
+            if _bar is not None:
+                _bar.update(received - _bar.n)
+
         try:
-            await client.download_media(message, file=str(dest))
+            await client.download_media(message, file=str(part),
+                                        progress_callback=progress)
             return finish()
-        except Exception as e2:  # noqa: BLE001
-            print(f"  failed msg {message.id}: {e2}")
-            return "failed"
-    except Exception as e:  # noqa: BLE001
-        # Clean up any partial file so the next run retries it.
-        if dest.exists() and dest.stat().st_size == 0:
-            dest.unlink(missing_ok=True)
-        print(f"  failed msg {message.id}: {e}")
-        return "failed"
-    finally:
-        if bar:
-            bar.close()
+        except FloodWaitError as e:
+            last_err = e
+            print(f"  rate-limited, waiting {e.seconds}s ...")
+            await asyncio.sleep(e.seconds + 1)
+        except Exception as e:  # noqa: BLE001 - network drops, timeouts, etc.
+            last_err = e
+            print(f"  error on msg {message.id} "
+                  f"(try {attempt}/3): {e}")
+            await asyncio.sleep(2 * attempt)
+        finally:
+            if bar:
+                bar.close()
+
+    # All attempts failed: drop the partial so next run re-downloads it.
+    if part.exists():
+        part.unlink(missing_ok=True)
+    print(f"  giving up on msg {message.id}: {last_err}")
+    return "failed"
 
 
 async def download_channel(client, entity, out_root, limit):
@@ -601,8 +610,14 @@ async def main():
     out_root.mkdir(parents=True, exist_ok=True)
 
     # flood_sleep_threshold: auto-wait through short rate limits silently.
+    # The retry/timeout settings make it ride out flaky connections.
     client = TelegramClient(args.session, api_id, api_hash,
-                            flood_sleep_threshold=60)
+                            flood_sleep_threshold=60,
+                            connection_retries=10,
+                            retry_delay=3,
+                            timeout=30,
+                            request_retries=10,
+                            auto_reconnect=True)
     # .start() handles the interactive login: phone -> SMS/app code ->
     # 2FA password if you have one. The session file remembers you after.
     await client.start()
