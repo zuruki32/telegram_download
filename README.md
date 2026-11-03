@@ -83,6 +83,11 @@ normal single-stream download, so downloads always still work. Each parallel
 connection goes through the same proxy as the main client, and each chunk is
 retried, so a slow handshake on a high-latency link doesn't abort a file.
 
+On a slow proxy the server often drops idle connections and Telethon silently
+reconnects — messages like `Server closed the connection: 0 bytes read...` are
+that recovery, not lost data (watch the progress bar: it keeps going). These
+are hidden by default; add `--verbose` to see them.
+
 On a slow/throttled proxy link you can raise the tolerances:
 
 ```bash

@@ -19,6 +19,7 @@ copyrighted material.
 import argparse
 import asyncio
 import json
+import logging
 import os
 import re
 import sys
@@ -1079,9 +1080,18 @@ async def main():
                              "a t.me/proxy MTProto link, mtproxy://host:port:secret, "
                              "or socks5://[user:pass@]host:port / http://host:port. "
                              "Can also be set as TG_PROXY in .env")
+    parser.add_argument("--verbose", action="store_true",
+                        help="show Telethon's reconnection messages (noisy on "
+                             "a flaky proxy; they're recoverable and hidden "
+                             "by default)")
     parser.add_argument("--session", default="tg_downloader",
                         help="session name; keeps you logged in between runs")
     args = parser.parse_args()
+
+    # A slow proxy link makes the server drop idle connections; Telethon
+    # reconnects on its own. Hide those recoverable warnings unless --verbose.
+    logging.getLogger("telethon").setLevel(
+        logging.INFO if args.verbose else logging.ERROR)
 
     # Offline log rebuild: no login, no downloads.
     if args.relog:
