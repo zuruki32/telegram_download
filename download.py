@@ -933,6 +933,7 @@ async def download_channel(client, entity, out_root, limit, verify=False,
     remaining = limit     # None = all
     hiccups = 0
     failed_ids = []       # files to retry before moving to the next channel
+    stalled_ids = []      # unreachable-now files, retried once at the end
     while True:
         try:
             async for message in client.iter_messages(entity, offset_id=last_id,
@@ -949,6 +950,8 @@ async def download_channel(client, entity, out_root, limit, verify=False,
                 counts[res] += 1
                 if res == "failed":
                     failed_ids.append(message.id)
+                elif res == "stalled":
+                    stalled_ids.append(message.id)
                 if remaining is not None:
                     remaining -= 1
             break   # finished the whole channel
@@ -996,6 +999,33 @@ async def download_channel(client, entity, out_root, limit, verify=False,
     if failed_ids:
         print(f"  {len(failed_ids)} file(s) still failed after retries; "
               f"re-run the app to pick them up.")
+
+    # Give unreachable-now files one more chance at the end of the channel,
+    # by which point a brief congestion blip on that DC may have cleared.
+    if stalled_ids:
+        print(f"  retrying {len(stalled_ids)} unreachable file(s) once more ...")
+        try:
+            messages = await client.get_messages(entity, ids=stalled_ids)
+        except Exception as e:  # noqa: BLE001
+            messages = []
+            print(f"  could not refetch unreachable files ({e})")
+        still = 0
+        for message in messages:
+            if message is None or not message.media:
+                continue
+            fname = message.file.name if message.file else None
+            sub = folder_for_file(message.message, fname, message.id)
+            res = await download_one(client, message, root / sub, done,
+                                     ledger_path, have, verify, dedup,
+                                     force_ids, fast)
+            if res == "stalled":
+                still += 1
+            else:
+                counts["stalled"] -= 1
+                counts[res] = counts.get(res, 0) + 1
+        if still:
+            print(f"  {still} file(s) still unreachable; they'll be picked up "
+                  f"on the next run.")
 
     if verify:
         rewrite_ledger(ledger_path, done)  # clean list matching real files
