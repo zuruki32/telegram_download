@@ -20,6 +20,7 @@ import argparse
 import asyncio
 import json
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -318,15 +319,49 @@ def record_done(done, ledger_path, message_id, name):
             pass
 
 
-def caption_subfolder(caption):
-    """Folder name for a novel, taken from the first line of its caption.
+# Trailing "volume / part / number" markers to strip off a title, e.g.
+# "Evil Love Appears 1-3", "Title (Vol 2)", "Name part 4".
+_VOL_TAIL = re.compile(
+    r"\s*(?:v(?:ol(?:ume)?)?|parts?|pts?|ch(?:apter)?s?|books?|bk"
+    r"|episodes?|eps?)?\s*[\(\[]?\s*\d+(?:\s*[-–~]+\s*\d+)?\s*[\)\]]?\s*$",
+    re.IGNORECASE)
 
-    Empty string means 'no caption' -> file stays in the channel folder.
+
+def _clean_title(text):
+    """Turn a caption line or filename into a tidy novel folder name.
+
+    Skips divider/emoji lines, drops a trailing volume/part number, and
+    returns "" if nothing book-like remains (so the file stays in the
+    channel folder instead of a junk folder like "--").
     """
-    caption = (caption or "").strip()
-    if not caption:
+    if not text:
         return ""
-    return safe_name(caption.splitlines()[0].strip(), "")
+    # Pick the first line that actually has words (>= 2 letters), so
+    # decorative lines such as "----" or "➖➖➖" are ignored.
+    line = ""
+    for candidate in str(text).splitlines():
+        if sum(ch.isalpha() for ch in candidate) >= 2:
+            line = candidate
+            break
+    if not line:
+        return ""
+    s = re.sub(r"[_\.]+", " ", line)          # separators -> spaces
+    s = re.sub(r"[\(\)\[\]]", " ", s)          # drop brackets
+    for _ in range(3):                         # peel trailing "vol/part N"
+        peeled = _VOL_TAIL.sub("", s).strip()
+        if peeled == s or sum(ch.isalpha() for ch in peeled) < 2:
+            break
+        s = peeled
+    s = re.sub(r"\s+", " ", s).strip(" -–_")
+    name = safe_name(s, "")
+    # safe_name may have turned emoji/symbols into "_"; tidy the edges.
+    name = re.sub(r"\s{2,}", " ", name).strip(" _-.")
+    return name if sum(ch.isalpha() for ch in name) >= 2 else ""
+
+
+def novel_folder(caption, filename=""):
+    """Subfolder name for a book: prefer the caption, else the filename."""
+    return _clean_title(caption) or _clean_title(Path(filename or "").stem)
 
 
 def message_ext(message):
@@ -436,12 +471,14 @@ async def download_channel(client, entity, out_root, limit):
         if not album:
             return
         caption = ""
+        fname = ""
         for m in album:
             text = (m.message or "").strip()
-            if text:
+            if text and not caption:
                 caption = text
-                break
-        sub = caption_subfolder(caption)
+            if m.file and m.file.name and not fname:
+                fname = m.file.name
+        sub = novel_folder(caption, fname)
         dest_folder = root / sub if sub else root
         for m in album:
             counts[await download_one(client, m, dest_folder,
@@ -483,7 +520,9 @@ async def listen_mode(client, entities, out_root):
     async def on_album(event):
         # A whole novel posted as one album -> its own subfolder.
         root, done, path = ledger_for(event.chat_id, event.chat)
-        sub = caption_subfolder(event.text)
+        fname = next((m.file.name for m in event.messages
+                      if m.file and m.file.name), "")
+        sub = novel_folder(event.text, fname)
         dest_folder = root / sub if sub else root
         title = getattr(event.chat, "title", str(event.chat_id))
         for m in event.messages:
@@ -497,7 +536,8 @@ async def listen_mode(client, entities, out_root):
         if event.message.grouped_id or not event.message.media:
             return
         root, done, path = ledger_for(event.chat_id, event.chat)
-        sub = caption_subfolder(event.message.message)
+        fname = event.message.file.name if event.message.file else ""
+        sub = novel_folder(event.message.message, fname)
         dest_folder = root / sub if sub else root
         title = getattr(event.chat, "title", str(event.chat_id))
         if await download_one(client, event.message, dest_folder,
