@@ -28,12 +28,25 @@ from telethon.tl.functions.upload import GetFileRequest
 class FastDownloader:
     """Reusable pool of parallel download connections, per data center."""
 
-    def __init__(self, client, connections=4):
+    def __init__(self, client, connections=4, retries=10, retry_delay=3):
         self.client = client
         self.connections = max(1, int(connections))
+        self.retries = max(1, int(retries))
+        self.retry_delay = retry_delay
         self._senders = {}     # dc_id -> [MTProtoSender, ...]
         self._auth_keys = {}   # dc_id -> AuthKey (for non-home DCs)
         self._lock = asyncio.Lock()
+
+    async def _call_retry(self, sender, request):
+        """One chunk request, retried through slow-link timeouts/hiccups."""
+        last = None
+        for attempt in range(self.retries):
+            try:
+                return await self.client._call(sender, request)
+            except Exception as e:  # noqa: BLE001 - WinError 121, timeouts, etc.
+                last = e
+                await asyncio.sleep(self.retry_delay)
+        raise last
 
     async def _make_sender(self, dc_id):
         client = self.client
@@ -94,7 +107,7 @@ class FastDownloader:
                     if done + i < part_count:
                         batch.append(
                             (i, asyncio.ensure_future(
-                                self.client._call(senders[i], reqs[i]))))
+                                self._call_retry(senders[i], reqs[i]))))
                 for i, fut in batch:
                     result = await fut
                     data = result.bytes

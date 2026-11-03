@@ -79,7 +79,16 @@ python download.py --connections 1    # old single-stream behaviour
 ```
 
 If the parallel path ever fails for a file, it automatically falls back to a
-normal single-stream download, so downloads always still work.
+normal single-stream download, so downloads always still work. Each parallel
+connection goes through the same proxy as the main client, and each chunk is
+retried, so a slow handshake on a high-latency link doesn't abort a file.
+
+On a slow/throttled proxy link you can raise the tolerances:
+
+```bash
+python download.py --proxy socks5://127.0.0.1:10808 --connections 8 \
+                   --timeout 60 --retries 15
+```
 
 ## Using a proxy (no VPN)
 

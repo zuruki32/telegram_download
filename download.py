@@ -971,6 +971,11 @@ async def main():
                         help="parallel connections per file to beat a "
                              "per-connection speed throttle (default 4; "
                              "use 1 for the old single-stream behaviour)")
+    parser.add_argument("--timeout", type=int, default=30, metavar="SEC",
+                        help="connection timeout (default 30; raise it on a "
+                             "slow/high-latency proxy link)")
+    parser.add_argument("--retries", type=int, default=10, metavar="N",
+                        help="connect/request/chunk retries (default 10)")
     parser.add_argument("--proxy", default="",
                         help="proxy to connect through (works without a VPN): "
                              "a t.me/proxy MTProto link, mtproxy://host:port:secret, "
@@ -1007,10 +1012,10 @@ async def main():
     # Optional proxy (to connect without a VPN). From --proxy or TG_PROXY.
     conn_cls, proxy = parse_proxy(args.proxy or os.environ.get("TG_PROXY", ""))
     client_kwargs = dict(flood_sleep_threshold=60,
-                         connection_retries=10,
+                         connection_retries=args.retries,
                          retry_delay=3,
-                         timeout=30,
-                         request_retries=10,
+                         timeout=args.timeout,
+                         request_retries=args.retries,
                          auto_reconnect=True)
     if conn_cls is not None:
         client_kwargs["connection"] = conn_cls
@@ -1034,7 +1039,8 @@ async def main():
     # Parallel downloader to beat a per-connection speed throttle.
     fast = None
     if args.connections > 1:
-        fast = FastDownloader(client, connections=args.connections)
+        fast = FastDownloader(client, connections=args.connections,
+                              retries=args.retries, retry_delay=3)
         print(f"Parallel download: {args.connections} connections per file.")
 
     # Message ids to force-download even if dedup would skip them.
