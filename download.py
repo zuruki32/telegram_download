@@ -18,6 +18,7 @@ copyrighted material.
 
 import argparse
 import asyncio
+import json
 import os
 import sys
 from pathlib import Path
@@ -37,6 +38,13 @@ except ImportError:  # progress bars are optional
 # are skipped.
 ALLOWED_EXTS = {"pdf", "epub", "mobi", "azw3", "azw", "djvu", "fb2",
                 "cbz", "cbr", "doc", "docx", "zip", "rar", "7z"}
+
+# Archive types we can unpack after downloading (when extraction is on).
+ARCHIVE_EXTS = {"zip", "rar", "7z"}
+EXTRACT = True  # set from --no-extract in main
+
+# Remembers which channels you chose, so you don't re-pick them every run.
+SELECTION_FILE = Path(__file__).resolve().parent / "selected_channels.json"
 
 
 # ---------------------------------------------------------------------------
@@ -98,6 +106,90 @@ def safe_name(text, fallback):
     return keep[:120] or fallback
 
 
+def load_selection():
+    """Return saved {channel_id: name} from a previous run."""
+    if SELECTION_FILE.exists():
+        try:
+            data = json.loads(SELECTION_FILE.read_text(encoding="utf-8"))
+            return {int(k): v for k, v in data.items()}
+        except Exception:  # noqa: BLE001
+            pass
+    return {}
+
+
+def save_selection(mapping):
+    """Persist {channel_id: name} so next run reuses it automatically."""
+    try:
+        SELECTION_FILE.write_text(
+            json.dumps({str(k): v for k, v in mapping.items()},
+                       ensure_ascii=False, indent=2),
+            encoding="utf-8")
+    except Exception as e:  # noqa: BLE001
+        print(f"  (could not save channel selection: {e})")
+
+
+def _within(base, target):
+    """Guard against archive entries escaping the destination folder."""
+    try:
+        base = base.resolve()
+        return base == target.resolve() or base in target.resolve().parents
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def extract_archive(path):
+    """Unpack a downloaded archive into a folder named after it.
+
+    The original archive is kept. Returns True if extraction succeeded.
+    """
+    path = Path(path)
+    ext = path.suffix.lower().lstrip(".")
+    dest = path.with_suffix("")  # e.g. book.zip -> book/
+    try:
+        if ext == "zip":
+            import zipfile
+            if not zipfile.is_zipfile(path):
+                return False
+            dest.mkdir(parents=True, exist_ok=True)
+            with zipfile.ZipFile(path) as z:
+                for member in z.namelist():
+                    out = dest / member
+                    if not _within(dest, out):
+                        print(f"  skipped unsafe path in {path.name}: {member}")
+                        continue
+                    z.extract(member, dest)
+            return True
+        if ext == "7z":
+            try:
+                import py7zr
+            except ImportError:
+                print("  (.7z found; run 'pip install py7zr' to auto-extract)")
+                return False
+            dest.mkdir(parents=True, exist_ok=True)
+            with py7zr.SevenZipFile(path, mode="r") as z:
+                z.extractall(path=dest)
+            return True
+        if ext == "rar":
+            try:
+                import rarfile
+            except ImportError:
+                print("  (.rar found; run 'pip install rarfile' and install "
+                      "WinRAR or 7-Zip to auto-extract)")
+                return False
+            dest.mkdir(parents=True, exist_ok=True)
+            with rarfile.RarFile(path) as z:
+                z.extractall(dest)
+            return True
+    except Exception as e:  # noqa: BLE001
+        print(f"  could not extract {path.name}: {e}")
+        try:  # remove an empty folder left behind by a failed extract
+            if dest.exists() and not any(dest.iterdir()):
+                dest.rmdir()
+        except Exception:  # noqa: BLE001
+            pass
+    return False
+
+
 async def list_dialogs(client):
     """Return the chats you've joined, newest-active first."""
     dialogs = []
@@ -106,7 +198,7 @@ async def list_dialogs(client):
     return dialogs
 
 
-async def pick_targets(client, all_flag):
+async def pick_targets(client, all_flag, reset=False):
     dialogs = await list_dialogs(client)
     # Only things that can hold files worth bulk-downloading.
     choices = [d for d in dialogs if isinstance(d.entity, (Channel, Chat))]
@@ -117,27 +209,53 @@ async def pick_targets(client, all_flag):
     if all_flag:
         return [d.entity for d in choices]
 
-    print("\nChannels / groups you've joined:\n")
+    by_id = {d.entity.id: d.entity for d in choices}
+    # Previously chosen channels you're still a member of.
+    saved = {} if reset else load_selection()
+    saved_ids = set(saved) & set(by_id)
+
+    print("\nChannels / groups you've joined "
+          "(✓ = already saved, downloaded every run):\n")
     for i, d in enumerate(choices):
-        e = d.entity
-        print(f"  [{i:>3}] {kind_label(e):<8} {d.name}")
-    print("\nEnter numbers separated by commas (e.g. 0,3,7), "
-          "or 'all' for everything.")
-    raw = input("Download from: ").strip().lower()
+        mark = "✓" if d.entity.id in saved_ids else " "
+        print(f"  {mark} [{i:>3}] {kind_label(d.entity):<8} {d.name}")
 
+    if saved_ids:
+        print(f"\n{len(saved_ids)} channel(s) already saved (marked ✓). "
+              "Type numbers to ADD more, or just press Enter to keep them.")
+        prompt = "Add channels (Enter = none): "
+    else:
+        print("\nEnter numbers separated by commas (e.g. 0,3,7), "
+              "or 'all' for everything.")
+        prompt = "Download from: "
+    raw = input(prompt).strip().lower()
+
+    added_ids = set()
     if raw == "all":
-        return [d.entity for d in choices]
+        added_ids = set(by_id)
+    elif raw:
+        for part in raw.replace(" ", "").split(","):
+            if not part:
+                continue
+            if not part.isdigit() or int(part) >= len(choices):
+                sys.exit(f"Invalid selection: {part}")
+            added_ids.add(choices[int(part)].entity.id)
 
-    picked = []
-    for part in raw.replace(" ", "").split(","):
-        if not part:
-            continue
-        if not part.isdigit() or int(part) >= len(choices):
-            sys.exit(f"Invalid selection: {part}")
-        picked.append(choices[int(part)].entity)
-    if not picked:
+    final_ids = saved_ids | added_ids
+    if not final_ids:
         sys.exit("Nothing selected.")
-    return picked
+
+    # Remember the full set (id -> name) for next time.
+    save_selection({cid: getattr(by_id[cid], "title", str(cid))
+                    for cid in final_ids})
+
+    new = added_ids - saved_ids
+    if new:
+        print(f"Added {len(new)} new channel(s). "
+              f"Now watching {len(final_ids)} total.")
+    elif saved_ids:
+        print(f"Using {len(final_ids)} saved channel(s).")
+    return [by_id[cid] for cid in final_ids]
 
 
 def target_filename(message, folder):
@@ -267,11 +385,17 @@ async def download_one(client, message, folder, done=None, ledger_path=None):
         if _bar is not None:
             _bar.update(received - _bar.n)
 
+    def finish():
+        record_done(done, ledger_path, message.id, dest.name)
+        if EXTRACT and message_ext(message) in ARCHIVE_EXTS:
+            if extract_archive(dest):
+                print(f"  extracted {dest.name}")
+        return "downloaded"
+
     try:
         await client.download_media(message, file=str(dest),
                                     progress_callback=progress)
-        record_done(done, ledger_path, message.id, dest.name)
-        return "downloaded"
+        return finish()
     except FloodWaitError as e:
         # Telegram asked us to slow down; honor it and retry once.
         if bar:
@@ -281,8 +405,7 @@ async def download_one(client, message, folder, done=None, ledger_path=None):
         await asyncio.sleep(e.seconds + 1)
         try:
             await client.download_media(message, file=str(dest))
-            record_done(done, ledger_path, message.id, dest.name)
-            return "downloaded"
+            return finish()
         except Exception as e2:  # noqa: BLE001
             print(f"  failed msg {message.id}: {e2}")
             return "failed"
@@ -387,7 +510,7 @@ async def listen_mode(client, entities, out_root):
 
 
 async def main():
-    global ALLOWED_EXTS
+    global ALLOWED_EXTS, EXTRACT
     parser = argparse.ArgumentParser(
         description="Download media files from Telegram channels you joined.")
     parser.add_argument("-o", "--out", default="downloads",
@@ -407,9 +530,15 @@ async def main():
     parser.add_argument("--all-types", action="store_true",
                         help="download every file type, no filtering "
                              "(photos, videos, everything)")
+    parser.add_argument("--no-extract", action="store_true",
+                        help="don't auto-unpack downloaded zip/rar/7z archives")
+    parser.add_argument("--reset-channels", action="store_true",
+                        help="forget saved channels and choose fresh")
     parser.add_argument("--session", default="tg_downloader",
                         help="session name; keeps you logged in between runs")
     args = parser.parse_args()
+
+    EXTRACT = not args.no_extract
 
     # Decide which file types to keep.
     if args.all_types:
@@ -435,7 +564,7 @@ async def main():
     print(f"Logged in as {me.first_name} "
           f"(@{me.username})" if me.username else f"Logged in as {me.first_name}")
 
-    targets = await pick_targets(client, args.all)
+    targets = await pick_targets(client, args.all, reset=args.reset_channels)
 
     # Backfill existing files first (unless --listen with --limit 0).
     if not (args.listen and args.limit == 0):

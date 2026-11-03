@@ -5,3 +5,4 @@
 downloads/
 __pycache__/
 *.pyc
+selected_channels.json

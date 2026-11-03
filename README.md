@@ -72,6 +72,34 @@ python download.py --ext pdf,epub     # keep only these types
 python download.py --all-types        # download everything, no filtering
 ```
 
+## Remembered channels
+
+The first time you pick channels, your choice is saved to
+`selected_channels.json` (gitignored). On later runs those channels are
+marked with a ✓ and downloaded automatically — you don't re-pick them. The
+full list still shows every channel, so you can type numbers to **add** newly
+joined ones; just press Enter to keep the saved set as-is.
+
+```bash
+python download.py --reset-channels   # forget the saved list and choose fresh
+```
+
+## Auto-extracting archives
+
+Downloaded `.zip`, `.rar`, and `.7z` files are unpacked automatically into a
+folder next to the archive, so books come out ready to read. The original
+archive is kept.
+
+- `.zip` works out of the box.
+- `.7z` uses the `py7zr` package (in requirements.txt).
+- `.rar` uses the `rarfile` package **plus** WinRAR or 7-Zip installed on your
+  system. If those aren't present, the `.rar` is downloaded but left for you
+  to open manually.
+
+```bash
+python download.py --no-extract       # keep archives packed
+```
+
 ## Listener mode (auto-download new files)
 
 Keep the app running so it downloads new files the moment they're posted:
