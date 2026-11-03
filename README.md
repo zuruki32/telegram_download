@@ -61,6 +61,17 @@ python download.py -o ~/tg-archive    # choose where files go
 python download.py --limit 500        # only scan the newest 500 messages per channel
 ```
 
+## File types
+
+By default it downloads **only ebook/document files** and skips photos,
+videos, stickers and audio. The default types are:
+`pdf, epub, mobi, azw3, azw, djvu, fb2, cbz, cbr, doc, docx`.
+
+```bash
+python download.py --ext pdf,epub     # keep only these types
+python download.py --all-types        # download everything, no filtering
+```
+
 ## Listener mode (auto-download new files)
 
 Keep the app running so it downloads new files the moment they're posted:

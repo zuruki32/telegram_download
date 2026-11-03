@@ -32,6 +32,13 @@ except ImportError:  # progress bars are optional
     tqdm = None
 
 
+# File extensions we keep. Set from --ext in main; None means "everything".
+# Default is ebook/document formats so photos, videos, stickers and audio
+# are skipped.
+ALLOWED_EXTS = {"pdf", "epub", "mobi", "azw3", "azw", "djvu", "fb2",
+                "cbz", "cbr", "doc", "docx"}
+
+
 # ---------------------------------------------------------------------------
 # Credentials
 # ---------------------------------------------------------------------------
@@ -204,15 +211,36 @@ def caption_subfolder(caption):
     return safe_name(caption.splitlines()[0].strip(), "")
 
 
+def message_ext(message):
+    """Lower-case extension (no dot) of a message's file, or ''."""
+    if message.file is None:
+        return ""
+    ext = message.file.ext or ""
+    if not ext and message.file.name:
+        ext = Path(message.file.name).suffix
+    return ext.lower().lstrip(".")
+
+
+def wanted(message):
+    """True if this file's type is one we download (per --ext)."""
+    if ALLOWED_EXTS is None:
+        return True
+    return message_ext(message) in ALLOWED_EXTS
+
+
 async def download_one(client, message, folder, done=None, ledger_path=None):
     """Download a single message's media into folder.
 
-    Returns 'downloaded', 'skipped', or 'failed'. Shared by the bulk
-    backfill and the live listener so both behave identically. `done` /
+    Returns 'downloaded', 'skipped', 'filtered', or 'failed'. Shared by the
+    bulk backfill and the live listener so both behave identically. `done` /
     `ledger_path` are the channel-level resume ledger.
     """
     if not message.media:
         return "skipped"
+
+    # Wrong file type (photo, video, ...) -> not what we're after.
+    if not wanted(message):
+        return "filtered"
 
     # Fast skip: the ledger already says this one is done.
     if done is not None and message.id in done:
@@ -275,7 +303,7 @@ async def download_channel(client, entity, out_root, limit):
     title = getattr(entity, "title", str(entity.id))
     print(f"\n=== {title} -> {root} ===")
 
-    counts = {"downloaded": 0, "skipped": 0, "failed": 0}
+    counts = {"downloaded": 0, "skipped": 0, "filtered": 0, "failed": 0}
     album = []          # messages of the album currently being collected
     album_gid = None    # grouped_id of that album
 
@@ -310,7 +338,8 @@ async def download_channel(client, entity, out_root, limit):
     await flush()
 
     print(f"  done: {counts['downloaded']} downloaded, "
-          f"{counts['skipped']} already had, {counts['failed']} failed")
+          f"{counts['skipped']} already had, "
+          f"{counts['filtered']} wrong type, {counts['failed']} failed")
     return counts["downloaded"], counts["skipped"], counts["failed"]
 
 
@@ -358,6 +387,7 @@ async def listen_mode(client, entities, out_root):
 
 
 async def main():
+    global ALLOWED_EXTS
     parser = argparse.ArgumentParser(
         description="Download media files from Telegram channels you joined.")
     parser.add_argument("-o", "--out", default="downloads",
@@ -370,9 +400,25 @@ async def main():
     parser.add_argument("--listen", action="store_true",
                         help="after grabbing history, keep running and "
                              "auto-download new files as they're posted")
+    parser.add_argument("--ext", default=",".join(sorted(ALLOWED_EXTS)),
+                        help="comma-separated file types to keep "
+                             "(default: ebook/document formats). "
+                             "e.g. --ext pdf,epub")
+    parser.add_argument("--all-types", action="store_true",
+                        help="download every file type, no filtering "
+                             "(photos, videos, everything)")
     parser.add_argument("--session", default="tg_downloader",
                         help="session name; keeps you logged in between runs")
     args = parser.parse_args()
+
+    # Decide which file types to keep.
+    if args.all_types:
+        ALLOWED_EXTS = None
+        print("Downloading ALL file types.")
+    else:
+        ALLOWED_EXTS = {e.strip().lower().lstrip(".")
+                        for e in args.ext.split(",") if e.strip()}
+        print(f"Keeping only: {', '.join(sorted(ALLOWED_EXTS))}")
 
     api_id, api_hash = get_credentials()
     out_root = Path(args.out).expanduser().resolve()
