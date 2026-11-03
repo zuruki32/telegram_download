@@ -224,8 +224,9 @@ async def pick_targets(client, all_flag, reset=False):
 
     if saved_ids:
         print(f"\n{len(saved_ids)} channel(s) already saved (marked ✓). "
-              "Type numbers to ADD more, or just press Enter to keep them.")
-        prompt = "Add channels (Enter = none): "
+              "Type numbers to ADD, or -number to REMOVE a saved one "
+              "(e.g. 4,-12). Press Enter to keep them as-is.")
+        prompt = "Add/remove (Enter = keep): "
     else:
         print("\nEnter numbers separated by commas (e.g. 0,3,7), "
               "or 'all' for everything.")
@@ -233,17 +234,21 @@ async def pick_targets(client, all_flag, reset=False):
     raw = input(prompt).strip().lower()
 
     added_ids = set()
+    removed_ids = set()
     if raw == "all":
         added_ids = set(by_id)
     elif raw:
         for part in raw.replace(" ", "").split(","):
             if not part:
                 continue
-            if not part.isdigit() or int(part) >= len(choices):
+            remove = part.startswith("-")
+            num = part[1:] if remove else part
+            if not num.isdigit() or int(num) >= len(choices):
                 sys.exit(f"Invalid selection: {part}")
-            added_ids.add(choices[int(part)].entity.id)
+            cid = choices[int(num)].entity.id
+            (removed_ids if remove else added_ids).add(cid)
 
-    final_ids = saved_ids | added_ids
+    final_ids = (saved_ids | added_ids) - removed_ids
     if not final_ids:
         sys.exit("Nothing selected.")
 
@@ -252,11 +257,12 @@ async def pick_targets(client, all_flag, reset=False):
                     for cid in final_ids})
 
     new = added_ids - saved_ids
+    gone = removed_ids & saved_ids
     if new:
-        print(f"Added {len(new)} new channel(s). "
-              f"Now watching {len(final_ids)} total.")
-    elif saved_ids:
-        print(f"Using {len(final_ids)} saved channel(s).")
+        print(f"Added {len(new)} channel(s).")
+    if gone:
+        print(f"Removed {len(gone)} channel(s).")
+    print(f"Now watching {len(final_ids)} channel(s).")
     return [by_id[cid] for cid in final_ids]
 
 

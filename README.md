@@ -78,7 +78,8 @@ The first time you pick channels, your choice is saved to
 `selected_channels.json` (gitignored). On later runs those channels are
 marked with a ✓ and downloaded automatically — you don't re-pick them. The
 full list still shows every channel, so you can type numbers to **add** newly
-joined ones; just press Enter to keep the saved set as-is.
+joined ones, or `-number` to **remove** a saved channel (e.g. `4,-12` adds 4
+and drops 12). Just press Enter to keep the saved set as-is.
 
 ```bash
 python download.py --reset-channels   # forget the saved list and choose fresh
