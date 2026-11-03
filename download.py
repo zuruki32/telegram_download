@@ -705,6 +705,35 @@ async def _fetch_media(client, message, part, progress, fast):
                                 progress_callback=progress)
 
 
+async def _fetch_guarded(client, message, part, progress, fast, stall=60):
+    """Run _fetch_media with a stall watchdog: if no data arrives for `stall`
+    seconds (a dead connection that never errors), abort so the caller can
+    retry or move on instead of hanging forever."""
+    loop = asyncio.get_event_loop()
+    state = {"t": loop.time()}
+
+    def watched(received, total):
+        state["t"] = loop.time()
+        progress(received, total)
+
+    task = asyncio.ensure_future(
+        _fetch_media(client, message, part, watched, fast))
+    try:
+        while True:
+            await asyncio.wait({task}, timeout=15)
+            if task.done():
+                return task.result()   # re-raises any download error
+            if loop.time() - state["t"] > stall:
+                raise TimeoutError(f"stalled: no data for {stall}s")
+    finally:
+        if not task.done():
+            task.cancel()
+            try:
+                await task
+            except BaseException:  # noqa: BLE001
+                pass
+
+
 async def download_one(client, message, folder, done=None, ledger_path=None,
                        have=None, verify=False, dedup=None, force_ids=None,
                        fast=None):
@@ -835,7 +864,7 @@ async def download_one(client, message, folder, done=None, ledger_path=None,
                 _bar.update(received - _bar.n)
 
         try:
-            await _fetch_media(client, message, part, progress, fast)
+            await _fetch_guarded(client, message, part, progress, fast)
             return finish()
         except FloodWaitError as e:
             last_err = e
