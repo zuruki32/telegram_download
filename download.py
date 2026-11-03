@@ -853,6 +853,7 @@ async def download_one(client, message, folder, done=None, ledger_path=None,
         return "downloaded"
 
     last_err = None
+    stalled = False
     for attempt in range(1, 4):  # up to 3 tries through network hiccups
         bar = None
         if tqdm is not None and message.file and message.file.size:
@@ -870,6 +871,14 @@ async def download_one(client, message, folder, done=None, ledger_path=None,
             last_err = e
             print(f"  rate-limited, waiting {e.seconds}s ...")
             await asyncio.sleep(e.seconds + 1)
+        except TimeoutError as e:
+            # Stalled = this file's data center is unreachable right now.
+            # Retrying this run won't help; skip it and get it next run.
+            last_err = e
+            stalled = True
+            if bar:
+                bar.close()
+            break
         except Exception as e:  # noqa: BLE001 - network drops, timeouts, etc.
             last_err = e
             print(f"  error on msg {message.id} "
@@ -879,9 +888,12 @@ async def download_one(client, message, folder, done=None, ledger_path=None,
             if bar:
                 bar.close()
 
-    # All attempts failed: drop the partial so next run re-downloads it.
+    # Drop the partial so next run re-downloads it.
     if part.exists():
         part.unlink(missing_ok=True)
+    if stalled:
+        print(f"  skipped (unreachable now), will retry next run: {dest.name}")
+        return "stalled"
     print(f"  giving up on msg {message.id}: {last_err}")
     return "failed"
 
@@ -914,7 +926,7 @@ async def download_channel(client, entity, out_root, limit, verify=False,
             print(f"  (pdf pre-scan interrupted: {e})")
 
     counts = {"downloaded": 0, "skipped": 0, "filtered": 0,
-              "duplicate": 0, "toobig": 0, "failed": 0}
+              "duplicate": 0, "toobig": 0, "stalled": 0, "failed": 0}
     # Resilient listing: if the connection drops mid-scan (flaky proxy link),
     # resume from the last message seen instead of abandoning the channel.
     last_id = 0           # resume point (messages come newest-first)
@@ -991,7 +1003,7 @@ async def download_channel(client, entity, out_root, limit, verify=False,
     print(f"  done: {counts['downloaded']} downloaded, "
           f"{counts['skipped']} already had, {counts['duplicate']} duplicates, "
           f"{counts['filtered']} wrong type, {counts['toobig']} too big, "
-          f"{counts['failed']} failed")
+          f"{counts['stalled']} unreachable, {counts['failed']} failed")
     return counts["downloaded"], counts["skipped"], counts["failed"]
 
 
