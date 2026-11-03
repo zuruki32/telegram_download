@@ -51,30 +51,48 @@ class FastDownloader:
         raise last
 
     async def _make_sender(self, dc_id):
+        """Create one connected sender, retrying the connect a few times.
+
+        All senders connect through the client's proxy (proxy=client._proxy),
+        so with Tun off only this process uses the tunnel.
+        """
         client = self.client
         dc = await client._get_dc(dc_id)
-        if dc_id == client.session.dc_id:
-            auth = client.session.auth_key          # home DC: reuse main key
-        else:
-            auth = self._auth_keys.get(dc_id)        # other DC: export once
-        sender = MTProtoSender(auth, loggers=client._log)
-        await sender.connect(client._connection(
-            dc.ip_address, dc.port, dc.id,
-            loggers=client._log, proxy=client._proxy))
-        if auth is None:
-            exported = await client(ExportAuthorizationRequest(dc_id))
-            init = client._init_request
-            init.query = ImportAuthorizationRequest(id=exported.id,
-                                                    bytes=exported.bytes)
-            await sender.send(InvokeWithLayerRequest(LAYER, init))
-            self._auth_keys[dc_id] = sender.auth_key
-        return sender
+        home = dc_id == client.session.dc_id
+        last = None
+        for attempt in range(3):
+            auth = client.session.auth_key if home else self._auth_keys.get(dc_id)
+            sender = MTProtoSender(auth, loggers=client._log)
+            try:
+                await sender.connect(client._connection(
+                    dc.ip_address, dc.port, dc.id,
+                    loggers=client._log, proxy=client._proxy))
+                if not home and auth is None:
+                    exported = await client(ExportAuthorizationRequest(dc_id))
+                    init = client._init_request
+                    init.query = ImportAuthorizationRequest(
+                        id=exported.id, bytes=exported.bytes)
+                    await sender.send(InvokeWithLayerRequest(LAYER, init))
+                    self._auth_keys[dc_id] = sender.auth_key
+                return sender
+            except Exception as e:  # noqa: BLE001
+                last = e
+                try:
+                    await sender.disconnect()
+                except Exception:  # noqa: BLE001
+                    pass
+                await asyncio.sleep(1 + attempt)
+        raise last
 
     async def _dc_senders(self, dc_id):
         async with self._lock:
             if dc_id not in self._senders:
-                self._senders[dc_id] = [await self._make_sender(dc_id)
-                                        for _ in range(self.connections)]
+                senders = []
+                for i in range(self.connections):
+                    if i:
+                        await asyncio.sleep(0.15)   # stagger, easier on the link
+                    senders.append(await self._make_sender(dc_id))
+                self._senders[dc_id] = senders
             return self._senders[dc_id]
 
     async def _drop(self, dc_id):

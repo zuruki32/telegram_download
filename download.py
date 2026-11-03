@@ -1137,9 +1137,9 @@ async def main():
                         help="don't download; just print caption + filename "
                              "+ chosen folder for the first N files "
                              "(for debugging folder names)")
-    parser.add_argument("--connections", type=int, default=4, metavar="N",
+    parser.add_argument("--connections", type=int, default=6, metavar="N",
                         help="parallel connections per file to beat a "
-                             "per-connection speed throttle (default 4; "
+                             "per-connection speed throttle (default 6; "
                              "use 1 for the old single-stream behaviour)")
     parser.add_argument("--timeout", type=int, default=30, metavar="SEC",
                         help="connection timeout (default 30; raise it on a "
