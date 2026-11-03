@@ -919,7 +919,8 @@ async def download_one(client, message, folder, done=None, ledger_path=None,
 
 
 async def download_channel(client, entity, out_root, limit, verify=False,
-                           dedup_opts=None, force_ids=None, fast=None):
+                           dedup_opts=None, force_ids=None, fast=None,
+                           save_unreachable=False):
     root = channel_folder(entity, out_root)
     done, ledger_path = load_ledger(root)
     # Index every file already on disk by its id/filename (a quick name scan,
@@ -1022,6 +1023,7 @@ async def download_channel(client, entity, out_root, limit, verify=False,
 
     # Give unreachable-now files one more chance at the end of the channel,
     # by which point a brief congestion blip on that DC may have cleared.
+    still_stalled = []
     if stalled_ids:
         print(f"  retrying {len(stalled_ids)} unreachable file(s) once more ...")
         try:
@@ -1029,7 +1031,7 @@ async def download_channel(client, entity, out_root, limit, verify=False,
         except Exception as e:  # noqa: BLE001
             messages = []
             print(f"  could not refetch unreachable files ({e})")
-        still = 0
+            still_stalled = list(stalled_ids)
         for message in messages:
             if message is None or not message.media:
                 continue
@@ -1039,13 +1041,24 @@ async def download_channel(client, entity, out_root, limit, verify=False,
                                      ledger_path, have, verify, dedup,
                                      force_ids, fast)
             if res == "stalled":
-                still += 1
+                still_stalled.append(message.id)
             else:
                 counts["stalled"] -= 1
                 counts[res] = counts.get(res, 0) + 1
-        if still:
-            print(f"  {still} file(s) still unreachable; they'll be picked up "
-                  f"on the next run.")
+        if still_stalled:
+            print(f"  {len(still_stalled)} file(s) still unreachable; they'll "
+                  f"be picked up on the next run.")
+
+    # Forward still-unreachable files to Saved Messages so they can be
+    # downloaded by hand in the official Telegram app (which reaches them).
+    if save_unreachable and still_stalled:
+        try:
+            await client.forward_messages("me", still_stalled, entity)
+            print(f"  forwarded {len(still_stalled)} unreachable file(s) to "
+                  f"Saved Messages -> download them in the Telegram app")
+        except Exception as e:  # noqa: BLE001
+            print(f"  could not forward to Saved Messages ({e}); the channel "
+                  f"may block forwarding")
 
     if verify:
         rewrite_ledger(ledger_path, done)  # clean list matching real files
@@ -1140,6 +1153,9 @@ async def main():
     parser.add_argument("--verify", action="store_true",
                         help="re-check each already-downloaded file is present "
                              "and not corrupt; re-download missing/broken ones")
+    parser.add_argument("--save-unreachable", action="store_true",
+                        help="forward files the app can't download to your "
+                             "Telegram Saved Messages, to grab by hand in the app")
     parser.add_argument("--relog", action="store_true",
                         help="just rebuild the _completed.txt logs from files "
                              "on disk (offline, no downloads) and exit")
@@ -1305,10 +1321,10 @@ async def main():
         totals = [0, 0, 0]
         for entity in targets:
             try:
-                d, s, f = await download_channel(client, entity, out_root,
-                                                 args.limit, verify=args.verify,
-                                                 dedup_opts=dedup_opts,
-                                                 force_ids=force_ids, fast=fast)
+                d, s, f = await download_channel(
+                    client, entity, out_root, args.limit, verify=args.verify,
+                    dedup_opts=dedup_opts, force_ids=force_ids, fast=fast,
+                    save_unreachable=args.save_unreachable)
                 totals[0] += d
                 totals[1] += s
                 totals[2] += f

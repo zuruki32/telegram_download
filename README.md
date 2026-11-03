@@ -61,6 +61,21 @@ python download.py -o ~/tg-archive    # choose where files go
 python download.py --limit 500        # only scan the newest 500 messages per channel
 ```
 
+## Files the app can't download
+
+A few files (CDN-served, or on a momentarily-unreachable path) can't be
+pulled over a proxy even after retries — they're marked `unreachable` and
+retried next run. To grab those by hand, forward them to your **Saved
+Messages** and download them in the official Telegram app (which reaches
+them easily):
+
+```bash
+python download.py --save-unreachable
+```
+
+Any still-unreachable file is forwarded to Saved Messages at the end of each
+channel. (If a channel blocks forwarding, it says so.)
+
 ## Download speed (parallel connections)
 
 On some routes each single connection is speed-throttled (common for
