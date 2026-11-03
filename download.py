@@ -487,6 +487,18 @@ async def download_one(client, message, folder, done=None, ledger_path=None,
     if have is not None and message.id in have:
         existing = have[message.id]
         if not verify or file_ok(existing):
+            # During verify, tidy a file left loose in the channel root
+            # (from older versions) into its own folder, like new downloads.
+            if verify and existing.parent == root:
+                target = folder / existing.name
+                if target != existing:
+                    try:
+                        folder.mkdir(parents=True, exist_ok=True)
+                        existing.replace(target)
+                        print(f"  moved into folder: {folder.name}")
+                        existing = target
+                    except Exception:  # noqa: BLE001
+                        pass
             try:
                 rel = str(existing.relative_to(root))
             except ValueError:
