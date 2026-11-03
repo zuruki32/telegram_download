@@ -24,7 +24,7 @@ import re
 import sys
 from pathlib import Path
 
-from telethon import TelegramClient, events
+from telethon import TelegramClient, events, connection
 from telethon.errors import FloodWaitError
 from telethon.tl.types import Channel, Chat, User
 
@@ -69,6 +69,58 @@ def load_env_file():
         key, _, value = line.partition("=")
         key, value = key.strip(), value.strip().strip('"').strip("'")
         os.environ.setdefault(key, value)
+
+
+def parse_proxy(url):
+    """Turn a proxy string into TelegramClient (connection, proxy) kwargs.
+
+    Supports, so you can run without a VPN:
+      - a Telegram MTProto proxy share link:
+        https://t.me/proxy?server=HOST&port=PORT&secret=SECRET
+        tg://proxy?server=HOST&port=PORT&secret=SECRET
+        mtproxy://HOST:PORT:SECRET
+      - a SOCKS or HTTP proxy:
+        socks5://[user:pass@]HOST:PORT   socks4://HOST:PORT   http://HOST:PORT
+
+    Returns (connection_class_or_None, proxy_or_None); (None, None) if empty.
+    """
+    url = (url or "").strip()
+    if not url:
+        return None, None
+
+    # Telegram MTProto proxy (share link or tg:// link).
+    if "proxy?" in url and "server=" in url:
+        from urllib.parse import urlparse, parse_qs
+        q = parse_qs(urlparse(url).query)
+        try:
+            server = q["server"][0]
+            port = int(q["port"][0])
+            secret = q["secret"][0]
+        except (KeyError, IndexError, ValueError):
+            sys.exit(f"Could not read server/port/secret from proxy link: {url}")
+        return (connection.ConnectionTcpMTProxyRandomizedIntermediate,
+                (server, port, secret))
+
+    if url.lower().startswith(("mtproxy://", "mtproto://")):
+        parts = url.split("://", 1)[1].split(":")
+        if len(parts) < 3:
+            sys.exit(f"MTProxy needs host:port:secret, got: {url}")
+        return (connection.ConnectionTcpMTProxyRandomizedIntermediate,
+                (parts[0], int(parts[1]), parts[2]))
+
+    # SOCKS5 / SOCKS4 / HTTP proxy.
+    m = re.match(
+        r"^(socks5|socks4|http)://(?:([^:@/]+):([^@/]*)@)?([^:/@]+):(\d+)/?$",
+        url, re.IGNORECASE)
+    if not m:
+        sys.exit(f"Could not parse proxy: {url}")
+    scheme, user, pw, host, port = (m.group(1).lower(), m.group(2),
+                                    m.group(3), m.group(4), int(m.group(5)))
+    proxy = {"proxy_type": scheme, "addr": host, "port": port, "rdns": True}
+    if user:
+        proxy["username"] = user
+        proxy["password"] = pw or ""
+    return None, proxy
 
 
 # Read from .env / environment first, fall back to prompting. Get these from
@@ -885,6 +937,11 @@ async def main():
                         help="don't download; just print caption + filename "
                              "+ chosen folder for the first N files "
                              "(for debugging folder names)")
+    parser.add_argument("--proxy", default="",
+                        help="proxy to connect through (works without a VPN): "
+                             "a t.me/proxy MTProto link, mtproxy://host:port:secret, "
+                             "or socks5://[user:pass@]host:port / http://host:port. "
+                             "Can also be set as TG_PROXY in .env")
     parser.add_argument("--session", default="tg_downloader",
                         help="session name; keeps you logged in between runs")
     args = parser.parse_args()
@@ -910,15 +967,23 @@ async def main():
     out_root = Path(args.out).expanduser().resolve()
     out_root.mkdir(parents=True, exist_ok=True)
 
+    # Optional proxy (to connect without a VPN). From --proxy or TG_PROXY.
+    conn_cls, proxy = parse_proxy(args.proxy or os.environ.get("TG_PROXY", ""))
+    client_kwargs = dict(flood_sleep_threshold=60,
+                         connection_retries=10,
+                         retry_delay=3,
+                         timeout=30,
+                         request_retries=10,
+                         auto_reconnect=True)
+    if conn_cls is not None:
+        client_kwargs["connection"] = conn_cls
+    if proxy is not None:
+        client_kwargs["proxy"] = proxy
+        print("Connecting through proxy.")
+
     # flood_sleep_threshold: auto-wait through short rate limits silently.
     # The retry/timeout settings make it ride out flaky connections.
-    client = TelegramClient(args.session, api_id, api_hash,
-                            flood_sleep_threshold=60,
-                            connection_retries=10,
-                            retry_delay=3,
-                            timeout=30,
-                            request_retries=10,
-                            auto_reconnect=True)
+    client = TelegramClient(args.session, api_id, api_hash, **client_kwargs)
     # .start() handles the interactive login: phone -> SMS/app code ->
     # 2FA password if you have one. The session file remembers you after.
     await client.start()

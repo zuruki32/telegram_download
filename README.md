@@ -61,6 +61,40 @@ python download.py -o ~/tg-archive    # choose where files go
 python download.py --limit 500        # only scan the newest 500 messages per channel
 ```
 
+## Using a proxy (no VPN)
+
+If Telegram is blocked on your network, connect the app through a proxy
+instead of a VPN. Pass it with `--proxy`, or put `TG_PROXY=...` in your `.env`.
+
+**MTProto proxy** (easiest for Telegram — the `t.me/proxy` links people
+share):
+
+```bash
+python download.py --proxy "https://t.me/proxy?server=HOST&port=PORT&secret=SECRET"
+```
+
+You can also write it as `mtproxy://HOST:PORT:SECRET`.
+
+**SOCKS5 / HTTP proxy** (e.g. from a VPS you control):
+
+```bash
+python download.py --proxy socks5://127.0.0.1:1080
+python download.py --proxy socks5://user:pass@HOST:PORT
+python download.py --proxy http://HOST:PORT
+```
+
+Or in `.env`:
+
+```
+TG_PROXY=https://t.me/proxy?server=HOST&port=PORT&secret=SECRET
+```
+
+Notes:
+- MTProto proxies need no extra setup. SOCKS/HTTP use the `python-socks`
+  package (already in `requirements.txt`).
+- Get a working MTProto proxy from the proxy channels people share on
+  Telegram, or run your own; the app can't provide one for you.
+
 ## File types
 
 By default it downloads **only ebook/document files** and skips photos,
