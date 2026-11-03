@@ -327,6 +327,70 @@ def record_done(done, ledger_path, message_id, relpath):
             pass
 
 
+def rewrite_ledger(ledger_path, done):
+    """Rewrite the ledger fresh from `done` (used after a --verify pass)."""
+    if ledger_path is None or done is None:
+        return
+    try:
+        with open(ledger_path, "w", encoding="utf-8") as f:
+            for mid in sorted(done):
+                f.write(f"{mid}\t{done[mid]}\n")
+    except Exception:  # noqa: BLE001
+        pass
+
+
+_ID_PREFIX = re.compile(r"^(\d+)_")
+
+
+def scan_existing(root):
+    """Map {message_id: path} for files already saved under this channel.
+
+    Every saved file is named "<id>_...", so this finds a file no matter
+    which folder it ended up in -- including older runs that used different
+    folder names. Lets us recognise what's already downloaded instead of
+    trusting only the recorded path.
+    """
+    have = {}
+    if not root.exists():
+        return have
+    for p in root.rglob("*"):
+        if not p.is_file() or p.name == LEDGER_NAME:
+            continue
+        m = _ID_PREFIX.match(p.name)
+        if m:
+            have.setdefault(int(m.group(1)), p)
+    return have
+
+
+def file_ok(path):
+    """Light integrity check: is this a non-empty, well-formed file?"""
+    try:
+        if not path.exists() or path.stat().st_size == 0:
+            return False
+        ext = path.suffix.lower().lstrip(".")
+        if ext == "pdf":
+            with open(path, "rb") as f:
+                return f.read(5).startswith(b"%PDF-")
+        if ext in ("zip", "epub", "cbz", "docx"):
+            import zipfile
+            return zipfile.is_zipfile(path)
+        if ext == "7z":
+            try:
+                import py7zr
+                return py7zr.is_7zfile(path)
+            except Exception:  # noqa: BLE001 - can't check -> assume ok
+                return True
+        if ext in ("rar", "cbr"):
+            try:
+                import rarfile
+                return rarfile.is_rarfile(path)
+            except Exception:  # noqa: BLE001
+                return True
+        return True  # other types: existence + non-zero size is enough
+    except Exception:  # noqa: BLE001
+        return False
+
+
 # Trailing "volume / part / number" markers to strip off a title, e.g.
 # "Evil Love Appears 1-3", "Title (Vol 2)", "Name part 4".
 _VOL_TAIL = re.compile(
@@ -401,12 +465,14 @@ def wanted(message):
     return message_ext(message) in ALLOWED_EXTS
 
 
-async def download_one(client, message, folder, done=None, ledger_path=None):
+async def download_one(client, message, folder, done=None, ledger_path=None,
+                       have=None, verify=False):
     """Download a single message's media into folder.
 
     Returns 'downloaded', 'skipped', 'filtered', or 'failed'. Shared by the
     bulk backfill and the live listener so both behave identically. `done` /
-    `ledger_path` are the channel-level resume ledger.
+    `ledger_path` are the channel resume ledger; `have` maps message ids to
+    files already on disk; `verify` re-checks those files aren't corrupt.
     """
     if not message.media:
         return "skipped"
@@ -417,11 +483,28 @@ async def download_one(client, message, folder, done=None, ledger_path=None):
 
     root = ledger_path.parent if ledger_path is not None else folder
 
-    # Skip only if the ledger says done AND that file is still on disk.
-    # If it was deleted or lived in an old folder layout, re-download it.
+    # Already downloaded somewhere under this channel (any folder layout)?
+    if have is not None and message.id in have:
+        existing = have[message.id]
+        if not verify or file_ok(existing):
+            try:
+                rel = str(existing.relative_to(root))
+            except ValueError:
+                rel = existing.name
+            if done is None or message.id not in done:
+                record_done(done, ledger_path, message.id, rel)
+            return "skipped"
+        print(f"  corrupt, re-downloading: {existing.name}")
+        try:
+            existing.unlink()
+        except Exception:  # noqa: BLE001
+            pass
+        have.pop(message.id, None)
+
+    # Normal fast path: the ledger recorded it and that file still exists.
     if done is not None and message.id in done:
-        rel = done[message.id]
-        if rel and (root / rel).exists():
+        recorded = done[message.id]
+        if recorded and (root / recorded).exists():
             return "skipped"
 
     folder.mkdir(parents=True, exist_ok=True)
@@ -431,7 +514,7 @@ async def download_one(client, message, folder, done=None, ledger_path=None):
     except ValueError:
         rel = dest.name
     # Backup skip: the file is already on disk (ledger lost or first run).
-    if dest.exists() and dest.stat().st_size > 0:
+    if dest.exists() and dest.stat().st_size > 0 and (not verify or file_ok(dest)):
         record_done(done, ledger_path, message.id, rel)
         return "skipped"
 
@@ -497,11 +580,19 @@ async def download_one(client, message, folder, done=None, ledger_path=None):
     return "failed"
 
 
-async def download_channel(client, entity, out_root, limit):
+async def download_channel(client, entity, out_root, limit, verify=False):
     root = channel_folder(entity, out_root)
     done, ledger_path = load_ledger(root)
+    # The one-time verify pass indexes every file on disk (by name, across
+    # all folders) and checks it's intact. Normal runs skip this and rely on
+    # the ledger, which the verify pass rebuilds to match reality.
+    have = scan_existing(root) if verify else None
     title = getattr(entity, "title", str(entity.id))
-    print(f"\n=== {title} -> {root} ===")
+    if verify:
+        print(f"\n=== {title} -> {root} "
+              f"(verifying {len(have)} files on disk) ===")
+    else:
+        print(f"\n=== {title} -> {root} ===")
 
     counts = {"downloaded": 0, "skipped": 0, "filtered": 0, "failed": 0}
     async for message in client.iter_messages(entity, limit=limit):
@@ -511,7 +602,10 @@ async def download_channel(client, entity, out_root, limit):
         sub = folder_for_file(message.message, fname, message.id)
         dest_folder = root / sub
         counts[await download_one(client, message, dest_folder,
-                                  done, ledger_path)] += 1
+                                  done, ledger_path, have, verify)] += 1
+
+    if verify:
+        rewrite_ledger(ledger_path, done)  # clean list matching real files
 
     print(f"  done: {counts['downloaded']} downloaded, "
           f"{counts['skipped']} already had, "
@@ -523,18 +617,18 @@ async def listen_mode(client, entities, out_root):
     """Stay connected and download new media as it's posted."""
     folders = {e.id: channel_folder(e, out_root) for e in entities}
     names = ", ".join(getattr(e, "title", str(e.id)) for e in entities)
-    ledgers = {}  # chat_id -> (root, done_set, ledger_path)
+    ledgers = {}  # chat_id -> (root, done, ledger_path, have)
 
     def ledger_for(chat_id, chat):
         if chat_id not in ledgers:
             root = folders.get(chat_id) or channel_folder(chat, out_root)
             done, path = load_ledger(root)
-            ledgers[chat_id] = (root, done, path)
+            ledgers[chat_id] = (root, done, path, scan_existing(root))
         return ledgers[chat_id]
 
     @client.on(events.Album(chats=entities))
     async def on_album(event):
-        root, done, path = ledger_for(event.chat_id, event.chat)
+        root, done, path, have = ledger_for(event.chat_id, event.chat)
         title = getattr(event.chat, "title", str(event.chat_id))
         for m in event.messages:
             if not m.media:
@@ -543,7 +637,7 @@ async def listen_mode(client, entities, out_root):
             sub = folder_for_file(m.message or event.text, fname, m.id)
             dest_folder = root / sub
             if await download_one(client, m, dest_folder,
-                                  done, path) == "downloaded":
+                                  done, path, have) == "downloaded":
                 print(f"[{title}] saved -> {dest_folder}")
 
     @client.on(events.NewMessage(chats=entities))
@@ -551,13 +645,13 @@ async def listen_mode(client, entities, out_root):
         # Album parts are handled by on_album; skip them here.
         if event.message.grouped_id or not event.message.media:
             return
-        root, done, path = ledger_for(event.chat_id, event.chat)
+        root, done, path, have = ledger_for(event.chat_id, event.chat)
         fname = event.message.file.name if event.message.file else None
         sub = folder_for_file(event.message.message, fname, event.message.id)
         dest_folder = root / sub
         title = getattr(event.chat, "title", str(event.chat_id))
         if await download_one(client, event.message, dest_folder,
-                              done, path) == "downloaded":
+                              done, path, have) == "downloaded":
             print(f"[{title}] saved -> {dest_folder}")
 
     print(f"\nListening for new files on: {names}")
@@ -593,6 +687,9 @@ async def main():
                              "successfully (saves disk space)")
     parser.add_argument("--reset-channels", action="store_true",
                         help="forget saved channels and choose fresh")
+    parser.add_argument("--verify", action="store_true",
+                        help="re-check each already-downloaded file is present "
+                             "and not corrupt; re-download missing/broken ones")
     parser.add_argument("--inspect", type=int, default=0, metavar="N",
                         help="don't download; just print caption + filename "
                              "+ chosen folder for the first N files "
@@ -666,7 +763,7 @@ async def main():
         for entity in targets:
             try:
                 d, s, f = await download_channel(client, entity, out_root,
-                                                 args.limit)
+                                                 args.limit, verify=args.verify)
                 totals[0] += d
                 totals[1] += s
                 totals[2] += f

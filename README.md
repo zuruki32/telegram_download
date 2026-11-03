@@ -72,6 +72,26 @@ python download.py --ext pdf,epub     # keep only these types
 python download.py --all-types        # download everything, no filtering
 ```
 
+## One-time verify (reconcile what you already downloaded)
+
+If you downloaded files with older versions (folders may be named
+differently now) or want to be sure nothing is missing or corrupt, run this
+**once**:
+
+```bash
+python download.py --verify
+```
+
+It finds every file already on disk **by its filename** (the message-id
+prefix), no matter which folder it's in — so your old folders count and
+aren't re-downloaded. It checks each file is present and not broken (valid
+PDF/zip/epub), re-downloads only the missing or corrupt ones, and rebuilds
+each channel's `_completed.txt` to match what's really there.
+
+You only do this once. Normal runs don't re-verify everything — new files
+are checked as they download (they're written to a temporary name and only
+marked complete once fully saved), so the completed list stays trustworthy.
+
 ## Remembered channels
 
 The first time you pick channels, your choice is saved to
