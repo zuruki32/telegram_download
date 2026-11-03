@@ -110,8 +110,9 @@ TG_PROXY=https://t.me/proxy?server=HOST&port=PORT&secret=SECRET
 ```
 
 Notes:
-- MTProto proxies need no extra setup. SOCKS/HTTP use the `python-socks`
-  package (already in `requirements.txt`).
+- MTProto proxies need no extra setup. SOCKS/HTTP use the `PySocks`
+  package (already in `requirements.txt`). Do **not** `pip install socks` —
+  that's a different, empty package; the right one is `PySocks`.
 - Get a working MTProto proxy from the proxy channels people share on
   Telegram, or run your own; the app can't provide one for you.
 
