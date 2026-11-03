@@ -120,6 +120,7 @@ class FastDownloader:
         downloaded = 0
         done = 0
         batch = []
+        failed = False
         try:
             while done < part_count:
                 # Fire one request per connection at once, collect in order.
@@ -146,19 +147,22 @@ class FastDownloader:
                     reqs[i].offset += stride
                 done += len(batch)
                 batch = []
-        except Exception:
-            # One chunk failed: cancel and drain the rest of this batch so
-            # their failures aren't reported as "Task exception never retrieved",
-            # then drop the (maybe-dead) pool so it's rebuilt next time.
+            return downloaded
+        except BaseException:   # includes CancelledError from the watchdog
+            failed = True
+            raise
+        finally:
+            # Always drain any still-pending chunk tasks (covers both errors
+            # AND cancellation), so none are left as "Task exception never
+            # retrieved". Drop the pool only when something went wrong.
             for _, fut in batch:
                 if not fut.done():
                     fut.cancel()
             if batch:
                 await asyncio.gather(*(f for _, f in batch),
                                      return_exceptions=True)
-            await self._drop(dc_id)
-            raise
-        return downloaded
+            if failed:
+                await self._drop(dc_id)
 
     async def close(self):
         for dc_id in list(self._senders):
