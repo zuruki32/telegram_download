@@ -179,28 +179,31 @@ python download.py --relog
 
 ## Duplicate detection
 
-To avoid the same book appearing twice **within one channel**, the app skips
-any file whose **byte size** matches another file already in **that channel's
-folder**. This is on by default and scoped **per channel** — the same book
-can still exist in different channels (you compare those yourself).
+Two independent checks, both on by default and scoped **per channel/group**
+(the same book can still exist in different channels — you compare those
+yourself):
+
+**1. Exact duplicates (everywhere).** Within one channel's folder, a file is
+skipped only when another file there has **both the same byte size and the
+same name**. Same size but a different name is kept, so unrelated books that
+happen to share a size aren't lost.
 
 ```bash
-python download.py --no-dedup          # turn duplicate skipping off
-python download.py --dedup-formats     # also skip a book you already have in
-                                       # another format (pdf vs epub)
+python download.py --no-dedup          # turn exact-duplicate skipping off
 ```
 
-`--dedup-formats` skips a novel you already have in a **different format**. It
-matches by base title with the trailing volume/part number removed, so a
-single `Novel.pdf` and its numbered epub parts (`Novel 1.epub`,
-`Novel 2.epub`, …) count as the same book: if you have the pdf, the epub parts
-are skipped, and if you have any epub part, the pdf is skipped. Extra parts in
-the **same** format are still downloaded. It relies on consistent naming, so
-leave it off if a channel names editions very differently.
+**2. PDF-over-EPUB (groups only).** In a **group**, if a book exists as a
+**PDF**, its **EPUB** is skipped — matched by base title with the trailing
+volume/part number removed, so a single `Novel.pdf` blocks `Novel 1.epub`,
+`Novel 2.epub`, … The PDF is always kept, and extra EPUB parts are kept only
+when there's no PDF. This does **not** apply to channels.
 
-Linked groups: pick the group in the channel list like any other chat. Since
-dedup is per channel, the group keeps its own copies (it's a separate folder)
-— handy when you want every channel/group to be self-contained.
+```bash
+python download.py --no-format-dedup   # keep both PDF and EPUB in groups
+```
+
+Every skip is written to `downloads/_skipped.txt` (id, channel, reason, name),
+so you can review and pull anything back with `--force-ids`.
 
 ### Reviewing skips
 

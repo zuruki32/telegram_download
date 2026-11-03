@@ -155,6 +155,13 @@ def kind_label(entity):
     return "chat"
 
 
+def is_group_entity(entity):
+    """True for groups/supergroups (not broadcast channels)."""
+    if isinstance(entity, Channel):
+        return not entity.broadcast
+    return isinstance(entity, Chat)
+
+
 def safe_name(text, fallback):
     """Make a string safe to use as a folder/file name."""
     text = (text or "").strip()
@@ -506,20 +513,25 @@ def base_title(filename):
     return re.sub(r"[^0-9a-z]", "", _clean_title(stem).lower())
 
 
+def norm_name(filename):
+    """Filename (id prefix removed) lowercased, for exact-name matching."""
+    return re.sub(r"^\d+_", "", str(filename or "")).strip().lower()
+
+
 class Dedup:
     """Remembers files already present so duplicates aren't downloaded again.
 
-    by_size: skip a download whose byte size matches a file we already have
-             (the reliable 'same file, maybe reposted or renamed' signal).
-    by_title: skip if we already have the same book (base title) in a
-              DIFFERENT format. Numbered parts in the same format are kept.
+    by_exact:  skip a file that matches one we have by BOTH size AND name
+               (a true duplicate, not just a size coincidence).
+    by_format: (groups only) if we already have the PDF of a book, skip its
+               EPUB(s) of the same base title (numbers removed). PDF wins.
     """
 
-    def __init__(self, by_size=True, by_title=False):
-        self.by_size = by_size
-        self.by_title = by_title
-        self.sizes = set()
-        self.title_exts = {}   # base title -> set of extensions seen
+    def __init__(self, by_exact=True, by_format=False):
+        self.by_exact = by_exact
+        self.by_format = by_format
+        self.size_names = {}   # size -> set of names at that size
+        self.pdf_titles = set()  # base titles we already have as PDF
         self.skip_log = None   # path to write skipped-as-duplicate rows
         self.skipped = 0
 
@@ -533,44 +545,46 @@ class Dedup:
         except Exception:  # noqa: BLE001
             pass
 
-    def why_duplicate(self, size, base, ext):
-        if self.by_size and size and size in self.sizes:
-            return "same size"
-        if self.by_title and base:
-            seen = self.title_exts.get(base)
-            if seen and any(e != ext for e in seen):
-                return f"same book, already have .{sorted(seen)[0]}"
+    def why_duplicate(self, size, name, base, ext):
+        if self.by_exact and size and name \
+                and name in self.size_names.get(size, ()):
+            return "same size + name"
+        if self.by_format and ext == "epub" and base in self.pdf_titles:
+            return "already have the PDF"
         return None
 
-    def add(self, size, base, ext):
-        if size:
-            self.sizes.add(size)
-        if base:
-            self.title_exts.setdefault(base, set()).add(ext)
+    def add(self, size, name, base, ext):
+        if size and name:
+            self.size_names.setdefault(size, set()).add(name)
+        if ext == "pdf" and base:
+            self.pdf_titles.add(base)
 
 
-def build_dedup(root, by_size, by_title):
-    """Index size, base title and format of files already in `root` (one
-    channel's folder), so that channel isn't given the same file twice."""
-    dd = Dedup(by_size, by_title)
+def build_dedup(root, by_exact, by_format):
+    """Index files already in `root` (one channel's folder) for dedup."""
+    dd = Dedup(by_exact, by_format)
     if root.exists():
         for p in root.rglob("*"):
             if (not p.is_file() or p.name == LEDGER_NAME
                     or p.name.endswith(".part") or not _ID_PREFIX.match(p.name)):
                 continue
             try:
-                dd.add(p.stat().st_size, base_title(p.name), _ext_of(p.name))
+                dd.add(p.stat().st_size, norm_name(p.name),
+                       base_title(p.name), _ext_of(p.name))
             except Exception:  # noqa: BLE001
                 pass
     return dd
 
 
-def make_dedup(root, dedup_opts):
-    """Build a per-channel Dedup from (by_size, by_title, skip_log), or None."""
+def make_dedup(root, dedup_opts, is_group=False):
+    """Build a per-channel Dedup from (by_exact, by_format, skip_log), or None.
+
+    The PDF/EPUB format policy only applies to groups.
+    """
     if dedup_opts is None:
         return None
-    by_size, by_title, skip_log = dedup_opts
-    dd = build_dedup(root, by_size, by_title)
+    by_exact, by_format, skip_log = dedup_opts
+    dd = build_dedup(root, by_exact, by_format and is_group)
     dd.skip_log = skip_log
     return dd
 
@@ -771,7 +785,8 @@ async def download_one(client, message, folder, done=None, ledger_path=None,
     if dedup is not None and not force:
         size = message.file.size if message.file else 0
         fname = message.file.name if message.file else ""
-        why = dedup.why_duplicate(size, base_title(fname), message_ext(message))
+        why = dedup.why_duplicate(size, norm_name(fname),
+                                  base_title(fname), message_ext(message))
         if why:
             print(f"  duplicate ({why}), skipping: {dest.name}")
             dedup.record_skip(message.id, root.name, why, dest.name)
@@ -803,7 +818,7 @@ async def download_one(client, message, folder, done=None, ledger_path=None,
                         print(f"  could not remove {dest.name}: {e}")
         record_done(done, ledger_path, message.id, saved_rel)
         if dedup is not None and message.file:
-            dedup.add(message.file.size,
+            dedup.add(message.file.size, norm_name(message.file.name),
                       base_title(message.file.name), message_ext(message))
         return "downloaded"
 
@@ -850,11 +865,23 @@ async def download_channel(client, entity, out_root, limit, verify=False,
     # so it works no matter which folder a file is in or what the log says.
     # --verify additionally reads each file to check it isn't corrupt.
     have = scan_existing(root)
-    dedup = make_dedup(root, dedup_opts)   # per-channel duplicate index
+    is_group = is_group_entity(entity)
+    dedup = make_dedup(root, dedup_opts, is_group)   # per-channel index
     title = getattr(entity, "title", str(entity.id))
     note = f" (verifying {len(have)} on disk)" if verify else \
            f" ({len(have)} already on disk)"
     print(f"\n=== {title} -> {root}{note} ===")
+
+    # Group + PDF/EPUB policy: pre-scan which books exist as PDF so we can
+    # skip their EPUBs no matter the message order.
+    if dedup is not None and dedup.by_format:
+        print("  scanning group for PDF/EPUB duplicates ...")
+        try:
+            async for m in client.iter_messages(entity):
+                if m.file and message_ext(m) == "pdf":
+                    dedup.pdf_titles.add(base_title(m.file.name))
+        except Exception as e:  # noqa: BLE001
+            print(f"  (pdf pre-scan interrupted: {e})")
 
     counts = {"downloaded": 0, "skipped": 0, "filtered": 0,
               "duplicate": 0, "toobig": 0, "failed": 0}
@@ -950,7 +977,8 @@ async def listen_mode(client, entities, out_root, dedup_opts=None,
             root = folders.get(chat_id) or channel_folder(chat, out_root)
             done, path = load_ledger(root)
             ledgers[chat_id] = (root, done, path, scan_existing(root),
-                                make_dedup(root, dedup_opts))
+                                make_dedup(root, dedup_opts,
+                                           is_group_entity(chat)))
         return ledgers[chat_id]
 
     @client.on(events.Album(chats=entities))
@@ -1024,12 +1052,12 @@ async def main():
                         help="just rebuild the _completed.txt logs from files "
                              "on disk (offline, no downloads) and exit")
     parser.add_argument("--no-dedup", action="store_true",
-                        help="don't skip files whose size matches one you "
-                             "already have (turns off duplicate detection)")
-    parser.add_argument("--dedup-formats", action="store_true",
-                        help="also skip a book you already have in another "
-                             "format (same title); best-effort, may skip "
-                             "differently-named editions")
+                        help="don't skip exact duplicates (same size AND name) "
+                             "within a channel")
+    parser.add_argument("--no-format-dedup", action="store_true",
+                        help="don't apply the group PDF-over-EPUB policy "
+                             "(by default, in groups, an EPUB is skipped when "
+                             "the same book's PDF exists)")
     parser.add_argument("--force-ids", default="",
                         help="comma-separated message ids to download even if "
                              "they'd be skipped as duplicates (from _skipped.txt)")
@@ -1127,7 +1155,9 @@ async def main():
     # yourself). dedup_opts carries the settings; the index is built per
     # channel inside download_channel / the listener.
     dedup_opts = None
-    if not args.no_dedup or args.dedup_formats:
+    by_exact = not args.no_dedup
+    by_format = not args.no_format_dedup
+    if by_exact or by_format:
         skip_log = out_root / "_skipped.txt"
         try:
             skip_log.write_text("# message_id\tchannel\treason\tfilename\n"
@@ -1135,14 +1165,13 @@ async def main():
                                 "--force-ids <id,id,...>\n", encoding="utf-8")
         except Exception:  # noqa: BLE001
             skip_log = None
-        dedup_opts = (not args.no_dedup, args.dedup_formats, skip_log)
+        dedup_opts = (by_exact, by_format, skip_log)
         bits = []
-        if not args.no_dedup:
-            bits.append("same size")
-        if args.dedup_formats:
-            bits.append("same title")
-        print(f"Duplicate check: per channel ({', '.join(bits)}). "
-              f"Skips listed in {skip_log}")
+        if by_exact:
+            bits.append("same size+name per channel")
+        if by_format:
+            bits.append("groups: skip EPUB when PDF exists")
+        print(f"Duplicate check: {'; '.join(bits)}. Skips listed in {skip_log}")
     else:
         print("Duplicate check: off.")
 
