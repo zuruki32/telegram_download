@@ -332,18 +332,29 @@ async def pick_targets(client, all_flag, reset=False):
 
 
 def target_filename(message, folder):
-    """Build a stable filename so re-runs can skip what's already done."""
-    # Prefer the original name if the sender attached one.
-    name = None
-    if message.file is not None:
-        name = message.file.name
-    ext = (message.file.ext if message.file else "") or ""
+    """Build a stable, filesystem-safe filename so re-runs can skip done ones.
+
+    Some files have junk names with newlines, '@', '#', etc. (an uploader
+    pasting the caption as the filename). We take a clean extension and
+    sanitize the whole stem so the path is always valid on Windows.
+    """
+    fobj = message.file
+    name = fobj.name if fobj else None
+
+    # A clean extension: letters/digits only (from the file's ext or name).
+    ext = (fobj.ext if fobj and fobj.ext else "") or ""
+    if not ext and name and "." in name:
+        ext = name.rsplit(".", 1)[-1]
+    ext = re.sub(r"[^0-9A-Za-z]", "", ext)[:10].lower()
+
     if name:
-        base = safe_name(Path(name).stem, f"msg{message.id}")
-        suffix = Path(name).suffix or ext
+        stem = name
+        if ext and stem.lower().endswith("." + ext):
+            stem = stem[: -(len(ext) + 1)]
+        base = safe_name(stem, f"msg{message.id}")   # strips newlines/@/#/...
     else:
         base = f"msg{message.id}"
-        suffix = ext
+    suffix = f".{ext}" if ext else ""
     # Prefix with message id to guarantee uniqueness and ordering.
     return folder / f"{message.id:>09}_{base}{suffix}"
 
