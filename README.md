@@ -187,6 +187,21 @@ You only do this once. Normal runs don't re-verify everything — new files
 are checked as they download (they're written to a temporary name and only
 marked complete once fully saved), so the completed list stays trustworthy.
 
+### Find duplicates across folders (no downloading)
+
+To see which books you have in more than one folder — including novels you
+added by hand — run an offline analysis:
+
+```bash
+python download.py --analyze
+```
+
+It scans every file under `downloads/` (any folder, not just Telegram ones),
+groups those with the **same byte size and a similar title**, and writes a
+comparison list to `downloads/_duplicates.txt` (biggest space savings first).
+Nothing is deleted — it's a report for you to review and clean up by hand. No
+Telegram login, no downloads.
+
 ### Just fix the log (no downloading)
 
 If you only want to tidy the `_completed.txt` logs — not re-download missing

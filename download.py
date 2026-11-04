@@ -453,6 +453,68 @@ def rebuild_logs(out_root):
     print(f"Rebuilt logs for {len(channels)} channel(s). No downloads made.")
 
 
+def analyze_duplicates(out_root):
+    """Offline: scan every file under out_root (any folder, including novels
+    added by hand) and report those that are the same across folders -- same
+    byte size AND similar title. No Telegram, no downloads."""
+    if not out_root.exists():
+        print(f"No downloads folder at {out_root}")
+        return
+
+    # Collect every real file (skip the app's own meta files and partials).
+    items = []   # (size, base_title, path, channel)
+    for p in out_root.rglob("*"):
+        if not p.is_file() or p.name.endswith(".part") or p.name.startswith("_"):
+            continue
+        try:
+            size = p.stat().st_size
+        except Exception:  # noqa: BLE001
+            continue
+        if size == 0:
+            continue
+        # base_title strips a leading "<id>_" only if present, so Telegram
+        # files and hand-added ones ("Novel.epub") compare the same way.
+        base = base_title(p.name)
+        try:
+            channel = p.relative_to(out_root).parts[0]
+        except Exception:  # noqa: BLE001
+            channel = ""
+        items.append((size, base, p, channel))
+
+    # Group by (exact size, similar title).
+    groups = {}
+    for size, base, p, channel in items:
+        groups.setdefault((size, base), []).append((p, channel))
+    dups = {k: v for k, v in groups.items() if len(v) > 1}
+
+    total_files = sum(len(v) for v in dups.values())
+    redundant = sum(size * (len(v) - 1) for (size, _), v in dups.items())
+
+    report = out_root / "_duplicates.txt"
+    lines = [
+        "# Files that look like the same book in more than one folder",
+        "# (matched by EXACT size + similar title). Nothing was deleted.",
+        f"# {len(dups)} groups, {total_files} files, "
+        f"~{redundant / 1024 / 1024:.1f} MB redundant across folders.",
+        "",
+    ]
+    # Biggest space savings first.
+    for (size, base), members in sorted(
+            dups.items(), key=lambda kv: kv[0][0] * (len(kv[1]) - 1),
+            reverse=True):
+        title = base or "(no title)"
+        lines.append(f"[{len(members)}x] {title}  —  {size / 1024:.0f} KB each")
+        for p, channel in sorted(members, key=lambda m: str(m[0])):
+            lines.append(f"    {p.relative_to(out_root)}")
+        lines.append("")
+
+    report.write_text("\n".join(lines), encoding="utf-8")
+    print(f"Scanned {len(items)} files in {out_root}.")
+    print(f"{len(dups)} duplicate group(s) across folders — {total_files} files, "
+          f"~{redundant / 1024 / 1024:.1f} MB redundant.")
+    print(f"Full comparison list written to: {report}")
+
+
 _ID_PREFIX = re.compile(r"^(\d+)_")
 
 
@@ -1170,6 +1232,10 @@ async def main():
     parser.add_argument("--relog", action="store_true",
                         help="just rebuild the _completed.txt logs from files "
                              "on disk (offline, no downloads) and exit")
+    parser.add_argument("--analyze", action="store_true",
+                        help="offline: scan all folders and report files that "
+                             "are the same across folders (same size + similar "
+                             "title), including hand-added ones; then exit")
     parser.add_argument("--no-dedup", action="store_true",
                         help="don't skip exact duplicates (same size AND name) "
                              "within a channel")
@@ -1218,6 +1284,11 @@ async def main():
     # Offline log rebuild: no login, no downloads.
     if args.relog:
         rebuild_logs(Path(args.out).expanduser().resolve())
+        return
+
+    # Offline duplicate analysis across all folders: no login, no downloads.
+    if args.analyze:
+        analyze_duplicates(Path(args.out).expanduser().resolve())
         return
 
     EXTRACT = not args.no_extract
