@@ -1210,6 +1210,10 @@ async def main():
     # reconnects on its own. Hide those recoverable warnings unless --verbose.
     logging.getLogger("telethon").setLevel(
         logging.INFO if args.verbose else logging.ERROR)
+    if not args.verbose:
+        # Quiet harmless "Task was destroyed but it is pending" teardown noise
+        # from connections being recreated after a stall.
+        logging.getLogger("asyncio").setLevel(logging.CRITICAL)
 
     # Offline log rebuild: no login, no downloads.
     if args.relog:
